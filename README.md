@@ -1,0 +1,270 @@
+# cl-revenue-ops
+
+A Revenue Operations Plugin for Core Lightning that provides intelligent fee management and profit-aware rebalancing.
+
+## Overview
+
+This plugin acts as a "Revenue Operations" layer that sits on top of the clboss automated manager. While clboss handles channel creation and node reliability, this plugin overrides clboss for fee setting and rebalancing decisions to maximize profitability based on economic principles rather than heuristics.
+
+## Key Features
+
+### Module 1: Flow Analysis & Sink/Source Detection
+- Analyzes routing flow through each channel over a configurable time window
+- Classifies channels as **SOURCE** (draining), **SINK** (filling), or **BALANCED**
+- Uses bookkeeper plugin data when available, falls back to listforwards
+
+### Module 2: PID Fee Controller
+- Implements a PID (Proportional-Integral-Derivative) controller for dynamic fee adjustment
+- Targets a configurable flow rate per channel
+- Includes liquidity-based fee multipliers
+- Never drops below economic floor (based on channel costs)
+
+### Module 3: EV-Based Rebalancing
+- Only executes rebalances with positive expected value
+- Calculates fee spread between outbound and inbound fees
+- Sets strict budget caps to ensure profitability
+- Supports both circular and sling rebalancer plugins
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    cl-revenue-ops Plugin                      │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐ │
+│  │  Flow Analyzer  │  │  PID Fee        │  │  EV          │ │
+│  │  (Sink/Source)  │─▶│  Controller     │─▶│  Rebalancer  │ │
+│  └────────┬────────┘  └────────┬────────┘  └──────┬───────┘ │
+│           │                    │                   │         │
+│           ▼                    ▼                   ▼         │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │                   Clboss Manager                        │ │
+│  │            (Manager-Override Pattern)                   │ │
+│  └─────────────────────────────────────────────────────────┘ │
+│           │                    │                   │         │
+└───────────┼────────────────────┼───────────────────┼─────────┘
+            ▼                    ▼                   ▼
+     ┌──────────┐         ┌──────────┐        ┌──────────┐
+     │ clboss   │         │ setchan  │        │ circular │
+     │ unmanage │         │ -nelfee  │        │  /sling  │
+     └──────────┘         └──────────┘        └──────────┘
+```
+
+## Installation
+
+### Prerequisites
+
+1. Core Lightning node running
+2. Python 3.8+
+3. bookkeeper plugin enabled (recommended) or just listforwards
+4. A rebalancer plugin installed (circular or sling)
+5. clboss (optional, for full integration)
+
+### Install Steps
+
+```bash
+# Clone or copy the plugin
+cd ~/.lightning/plugins
+git clone <repo-url> cl-revenue-ops
+cd cl-revenue-ops
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Make the plugin executable
+chmod +x cl-revenue-ops.py
+
+# Start the plugin dynamically
+lightning-cli plugin start ~/.lightning/plugins/cl-revenue-ops/cl-revenue-ops.py
+
+# Or add to config for automatic loading
+echo "plugin=~/.lightning/plugins/cl-revenue-ops/cl-revenue-ops.py" >> ~/.lightning/config
+```
+
+## Configuration Options
+
+All options can be set via `lightning-cli` at startup or in your config file:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `revenue-ops-db-path` | `~/.lightning/revenue_ops.db` | SQLite database path |
+| `revenue-ops-flow-interval` | `3600` | Flow analysis interval (seconds) |
+| `revenue-ops-fee-interval` | `1800` | Fee adjustment interval (seconds) |
+| `revenue-ops-rebalance-interval` | `900` | Rebalance check interval (seconds) |
+| `revenue-ops-target-flow` | `100000` | Target daily flow per channel (sats) |
+| `revenue-ops-min-fee-ppm` | `10` | Minimum fee floor (PPM) |
+| `revenue-ops-max-fee-ppm` | `5000` | Maximum fee ceiling (PPM) |
+| `revenue-ops-rebalance-min-profit` | `10` | Min profit to trigger rebalance (sats) |
+| `revenue-ops-pid-kp` | `0.5` | PID Proportional gain |
+| `revenue-ops-pid-ki` | `0.1` | PID Integral gain |
+| `revenue-ops-pid-kd` | `0.05` | PID Derivative gain |
+| `revenue-ops-flow-window-days` | `7` | Days to analyze for flow |
+| `revenue-ops-clboss-enabled` | `true` | Enable clboss integration |
+| `revenue-ops-rebalancer` | `circular` | Rebalancer plugin (circular/sling) |
+| `revenue-ops-dry-run` | `false` | Log actions without executing |
+
+Example config:
+
+```
+# ~/.lightning/config
+revenue-ops-target-flow=200000
+revenue-ops-min-fee-ppm=50
+revenue-ops-dry-run=true  # Test mode
+```
+
+## RPC Commands
+
+### `revenue-status`
+Get current plugin status and recent activity.
+
+```bash
+lightning-cli revenue-status
+```
+
+### `revenue-analyze [channel_id]`
+Run flow analysis on demand.
+
+```bash
+# Analyze all channels
+lightning-cli revenue-analyze
+
+# Analyze specific channel
+lightning-cli revenue-analyze 123x456x0
+```
+
+### `revenue-set-fee channel_id fee_ppm`
+Manually set a channel fee (with clboss unmanage).
+
+```bash
+lightning-cli revenue-set-fee 123x456x0 500
+```
+
+### `revenue-rebalance from_channel to_channel amount_sats [max_fee_sats]`
+Manually trigger a rebalance with profit constraints.
+
+```bash
+lightning-cli revenue-rebalance 123x456x0 789x012x1 500000
+```
+
+### `revenue-clboss-status`
+Check clboss integration status.
+
+```bash
+lightning-cli revenue-clboss-status
+```
+
+### `revenue-remanage peer_id [tag]`
+Re-enable clboss management for a peer.
+
+```bash
+lightning-cli revenue-remanage 03abc...def lnfee
+```
+
+## Manager-Override Pattern
+
+This plugin uses a "Manager-Override" pattern to coexist with clboss:
+
+1. **Detection**: Before changing any channel state, check if clboss is managing the peer
+2. **Override**: Call `clboss-unmanage` for the specific tag (e.g., `lnfee`)
+3. **Action**: Make our changes (set fee, trigger rebalance)
+4. **Track**: Record what we've unmanaged for later reversion if needed
+
+This allows:
+- clboss to handle channel creation and peer selection (what it's good at)
+- revenue-ops to handle fee optimization and profitable rebalancing (our specialty)
+
+## How It Works
+
+### Flow Analysis
+
+Every hour (configurable), the plugin:
+
+1. Queries bookkeeper or listforwards for the past 7 days
+2. Calculates net flow: `FlowRatio = (SatsOut - SatsIn) / Capacity`
+3. Classifies channels:
+   - `FlowRatio > 0.5`: **SOURCE** (draining out) - These are money printers!
+   - `FlowRatio < -0.5`: **SINK** (filling up) - These fill for free
+   - Otherwise: **BALANCED**
+
+### PID Fee Control
+
+Every 30 minutes (configurable), the plugin:
+
+1. Calculates error: `Error = TargetFlow - ActualFlow`
+2. Applies PID formula: `Output = Kp*error + Ki*integral + Kd*derivative`
+3. Adjusts fees based on output and liquidity level
+4. Enforces floor (economic minimum) and ceiling
+
+### EV Rebalancing
+
+Every 15 minutes (configurable), the plugin:
+
+1. Identifies channels low on outbound liquidity
+2. **CRITICAL: Checks flow state first**
+   - If target is a **SINK**: SKIP (it fills itself for free!)
+   - If target is a **SOURCE**: HIGH PRIORITY (keep it full!)
+3. Calculates spread: `Spread = OutboundFeePPM - InboundFeePPM`
+4. Computes max fee as PPM: `MaxPPM = (MaxBudget / Amount) * 1,000,000`
+5. Only executes if spread is positive and profit > minimum
+6. Calls circular via RPC with strict `maxppm` constraint
+
+### Circular Integration (Strategist & Driver Pattern)
+
+This plugin acts as the **Strategist** while circular is the **Driver**:
+
+```python
+# We calculate the EV constraint
+max_ppm = int((max_fee_msat / amount_msat) * 1_000_000)
+
+# We tell circular what to do via RPC
+result = plugin.rpc.circular(
+    outgoing_scid,    # Channel to drain
+    incoming_scid,    # Channel to fill
+    amount_msat,      # How much to move
+    max_ppm,          # THE KEY CONSTRAINT - circular won't exceed this
+    retry_count       # Number of retries
+)
+```
+
+This separation of concerns means:
+- **revenue-ops** handles the economics (when to rebalance, how much to pay)
+- **circular** handles the mechanics (pathfinding, HTLC management)
+
+### Anti-Thrashing Protection
+
+After a successful rebalance, the plugin keeps the peer unmanaged from clboss's rebalancing logic. This prevents clboss from immediately "fixing" the channel balance and wasting the fees we just paid.
+
+## Monitoring
+
+Check the database for historical data:
+
+```bash
+sqlite3 ~/.lightning/revenue_ops.db "SELECT * FROM fee_changes ORDER BY timestamp DESC LIMIT 10;"
+sqlite3 ~/.lightning/revenue_ops.db "SELECT * FROM rebalance_history ORDER BY timestamp DESC LIMIT 10;"
+```
+
+## Troubleshooting
+
+### Plugin won't start
+- Check Python version: `python3 --version` (need 3.8+)
+- Install dependencies: `pip install pyln-client`
+- Check logs: `lightning-cli getlog debug | grep revenue`
+
+### Fees not changing
+- Ensure `dry-run` is `false`
+- Check if clboss is reverting (enable `clboss-enabled`)
+- Verify flow analysis has run: `lightning-cli revenue-status`
+
+### Rebalances not happening
+- Check if spread is positive: `lightning-cli revenue-status`
+- Verify rebalancer plugin is installed
+- Check minimum profit threshold
+
+## License
+
+MIT License
+
+## Contributing
+
+Contributions welcome! Please open issues or PRs on the repository.

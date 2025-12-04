@@ -1,0 +1,7 @@
+# cl-revenue-ops dependencies
+
+# Core Lightning Python client library
+pyln-client>=24.02
+
+# Optional: better JSON handling
+# orjson>=3.9.0
