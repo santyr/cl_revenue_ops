@@ -221,7 +221,12 @@ class PIDFeeController:
         i_term = self.config.pid_ki * pid_state.integral
         
         # D: Derivative (rate of change of error)
-        derivative = (error - pid_state.last_error) / max(dt_hours, 0.1)
+        # CRITICAL: Skip derivative on first run to prevent spike
+        # When last_update == 0, we have no valid previous error to compare
+        if pid_state.last_update == 0:
+            derivative = 0.0
+        else:
+            derivative = (error - pid_state.last_error) / max(dt_hours, 0.1)
         d_term = self.config.pid_kd * derivative
         
         # Combined PID output (in fee adjustment direction)

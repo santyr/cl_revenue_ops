@@ -201,9 +201,22 @@ class EVRebalancer:
         
         # Analyze each depleted channel for rebalance EV
         for dest_id, dest_info, dest_ratio in depleted_channels:
-            # Skip if recently attempted
+            # Skip if recently attempted (in-memory pending check)
             if self._is_pending(dest_id):
                 continue
+            
+            # Skip if within cooldown period from DB (successful rebalance cooldown)
+            last_rebalance = self.database.get_last_rebalance_time(dest_id)
+            if last_rebalance:
+                cooldown_seconds = self.config.rebalance_cooldown_hours * 3600
+                time_since_last = int(time.time()) - last_rebalance
+                if time_since_last < cooldown_seconds:
+                    hours_remaining = (cooldown_seconds - time_since_last) / 3600
+                    self.plugin.log(
+                        f"Skipping {dest_id}: within {self.config.rebalance_cooldown_hours}h "
+                        f"cooldown ({hours_remaining:.1f}h remaining)"
+                    )
+                    continue
             
             candidate = self._analyze_rebalance_ev(
                 dest_id, dest_info, dest_ratio, source_channels

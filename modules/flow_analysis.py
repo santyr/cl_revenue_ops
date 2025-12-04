@@ -417,6 +417,10 @@ class FlowAnalyzer:
         listforwards provides basic forward history when bookkeeper
         is not available.
         
+        WARNING: listforwards can return HUGE datasets on busy nodes!
+        Nodes with 100k+ forwards will see memory spikes and slow queries.
+        Consider installing and enabling bookkeeper plugin for better performance.
+        
         Args:
             channel_id: Optional specific channel to query
             
@@ -428,6 +432,13 @@ class FlowAnalyzer:
         # Calculate time window
         window_seconds = self.config.flow_window_days * 86400
         start_time = int(time.time()) - window_seconds
+        
+        # WARNING: Memory bomb potential on busy nodes
+        self.plugin.log(
+            "WARNING: Using listforwards fallback - this can be slow/memory-intensive "
+            "on busy nodes. Consider enabling bookkeeper plugin for better performance.",
+            level='warning'
+        )
         
         try:
             # Query listforwards

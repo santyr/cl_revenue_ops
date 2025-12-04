@@ -326,6 +326,29 @@ class Database:
         """, (limit,)).fetchall()
         return [dict(row) for row in rows]
     
+    def get_last_rebalance_time(self, channel_id: str) -> Optional[int]:
+        """
+        Get the timestamp of the last successful rebalance for a channel.
+        
+        Used to enforce rebalance cooldown periods to prevent thrashing.
+        
+        Args:
+            channel_id: The destination channel of the rebalance
+            
+        Returns:
+            Unix timestamp of last successful rebalance, or None if never
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT MAX(timestamp) as last_time
+            FROM rebalance_history 
+            WHERE to_channel = ? AND status = 'success'
+        """, (channel_id,)).fetchone()
+        
+        if row and row['last_time']:
+            return row['last_time']
+        return None
+    
     # =========================================================================
     # Forward Tracking Methods
     # =========================================================================
