@@ -605,14 +605,15 @@ class EVRebalancer:
         )
         
         try:
-            # Call circular via RPC with our calculated maxppm constraint
-            # This is the KEY integration point - we pass maxppm, not maxfeepercent
+            # Call circular via RPC with positional arguments:
+            # circular outscid inscid [amount] [maxppm] [attempts] [maxhops]
             response = self.plugin.rpc.circular(
-                candidate.from_channel,      # outgoing_scid
-                candidate.to_channel,        # incoming_scid  
+                candidate.from_channel,      # outscid - outgoing channel
+                candidate.to_channel,        # inscid - incoming channel
                 candidate.amount_msat,       # amount in msat
                 candidate.max_fee_ppm,       # maxppm - THE CRITICAL CONSTRAINT
-                3                            # retry_count
+                3,                           # attempts
+                10                           # maxhops
             )
             
             # Analyze Result
@@ -794,22 +795,30 @@ class EVRebalancer:
                     continue
                 
                 # Extract balance info
-                spendable_msat = channel.get("spendable_msat", 0)
-                receivable_msat = channel.get("receivable_msat", 0)
-                total_msat = channel.get("total_msat", 0)
+                spendable_msat = channel.get("spendable_msat", 0) or 0
+                receivable_msat = channel.get("receivable_msat", 0) or 0
                 
-                # Handle different CLN versions
-                if total_msat == 0:
+                # Calculate capacity - may be null in some CLN versions
+                total_msat = channel.get("total_msat") or channel.get("capacity_msat")
+                if not total_msat:
                     total_msat = spendable_msat + receivable_msat
+                
+                # Get fee info - in newer CLN it's under updates.local
+                updates = channel.get("updates", {})
+                local_updates = updates.get("local", {})
+                
+                # Try updates.local first, fall back to top-level
+                fee_base = local_updates.get("fee_base_msat") or channel.get("fee_base_msat", 0)
+                fee_ppm = local_updates.get("fee_proportional_millionths") or channel.get("fee_proportional_millionths", 0)
                 
                 channels[channel_id] = {
                     "channel_id": channel_id,
                     "peer_id": channel.get("peer_id", ""),
-                    "capacity": total_msat // 1000,
+                    "capacity": total_msat // 1000 if total_msat else 0,
                     "spendable_sats": spendable_msat // 1000,
                     "receivable_sats": receivable_msat // 1000,
-                    "fee_base_msat": channel.get("fee_base_msat", 0),
-                    "fee_ppm": channel.get("fee_proportional_millionths", 0)
+                    "fee_base_msat": fee_base,
+                    "fee_ppm": fee_ppm
                 }
                 
         except RpcError as e:

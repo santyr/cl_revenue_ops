@@ -32,6 +32,7 @@ import sys
 import time
 import json
 import sqlite3
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
@@ -208,54 +209,56 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     fee_controller = PIDFeeController(plugin, config, database, clboss_manager)
     rebalancer = EVRebalancer(plugin, config, database, clboss_manager)
     
-    # Set up periodic timers using plugin.add_timer (thread-safe)
-    # CRITICAL: pyln-client is NOT thread-safe for stdout writes!
-    # Using threading.Thread will cause JSON interleaving crashes.
-    # plugin.add_timer schedules callbacks in the main event loop.
+    # Set up periodic background tasks using threading
+    # Note: plugin.log() is safe to call from threads in pyln-client
+    # We use daemon threads so they don't block shutdown
     
-    def flow_analysis_timer():
-        """Timer callback for flow analysis. Reschedules itself."""
-        try:
-            plugin.log("Running scheduled flow analysis...")
-            run_flow_analysis()
-            
-            # Run cleanup on each iteration (it's a fast DELETE query)
-            # Keeps history tables from growing unbounded over months
-            if database:
-                database.cleanup_old_data(days_to_keep=30)
+    def flow_analysis_loop():
+        """Background loop for flow analysis."""
+        # Initial delay to let lightningd fully start
+        time.sleep(10)
+        while True:
+            try:
+                plugin.log("Running scheduled flow analysis...")
+                run_flow_analysis()
                 
-        except Exception as e:
-            plugin.log(f"Error in flow analysis: {e}", level='error')
-        # Reschedule for next interval
-        plugin.add_timer(config.flow_interval, flow_analysis_timer)
+                # Run cleanup on each iteration (it's a fast DELETE query)
+                # Keeps history tables from growing unbounded over months
+                if database:
+                    database.cleanup_old_data(days_to_keep=30)
+                    
+            except Exception as e:
+                plugin.log(f"Error in flow analysis: {e}", level='error')
+            time.sleep(config.flow_interval)
     
-    def fee_adjustment_timer():
-        """Timer callback for fee adjustment. Reschedules itself."""
-        try:
-            plugin.log("Running scheduled fee adjustment...")
-            run_fee_adjustment()
-        except Exception as e:
-            plugin.log(f"Error in fee adjustment: {e}", level='error')
-        # Reschedule for next interval
-        plugin.add_timer(config.fee_interval, fee_adjustment_timer)
+    def fee_adjustment_loop():
+        """Background loop for fee adjustment."""
+        # Initial delay to let flow analysis run first
+        time.sleep(60)
+        while True:
+            try:
+                plugin.log("Running scheduled fee adjustment...")
+                run_fee_adjustment()
+            except Exception as e:
+                plugin.log(f"Error in fee adjustment: {e}", level='error')
+            time.sleep(config.fee_interval)
     
-    def rebalance_check_timer():
-        """Timer callback for rebalance check. Reschedules itself."""
-        try:
-            plugin.log("Running scheduled rebalance check...")
-            run_rebalance_check()
-        except Exception as e:
-            plugin.log(f"Error in rebalance check: {e}", level='error')
-        # Reschedule for next interval
-        plugin.add_timer(config.rebalance_interval, rebalance_check_timer)
+    def rebalance_check_loop():
+        """Background loop for rebalance checks."""
+        # Initial delay to let other analyses run first
+        time.sleep(120)
+        while True:
+            try:
+                plugin.log("Running scheduled rebalance check...")
+                run_rebalance_check()
+            except Exception as e:
+                plugin.log(f"Error in rebalance check: {e}", level='error')
+            time.sleep(config.rebalance_interval)
     
-    # Schedule initial timers with staggered starts
-    # Flow analysis first
-    plugin.add_timer(10, flow_analysis_timer)
-    # Fee adjustment after flow analysis has run once
-    plugin.add_timer(60, fee_adjustment_timer)
-    # Rebalance check after both have had time to run
-    plugin.add_timer(120, rebalance_check_timer)
+    # Start background threads (daemon=True so they don't block shutdown)
+    threading.Thread(target=flow_analysis_loop, daemon=True, name="flow-analysis").start()
+    threading.Thread(target=fee_adjustment_loop, daemon=True, name="fee-adjustment").start()
+    threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
     
     plugin.log("cl-revenue-ops plugin initialized successfully!")
     return None

@@ -170,14 +170,11 @@ class ClbossManager:
                 self.plugin.log(result["message"])
                 return result
             
-            # Call clboss-unmanage
+            # Call clboss-unmanage with positional args: nodeid tags
             try:
                 unmanage_result = self.plugin.rpc.call(
                     "clboss-unmanage",
-                    {
-                        "node_id": peer_id,
-                        "tags": tag
-                    }
+                    [peer_id, tag]  # positional: nodeid, tags
                 )
                 
                 result["success"] = True
@@ -239,16 +236,14 @@ class ClbossManager:
         
         try:
             # Call clboss-manage to re-enable management
+            # clboss-manage nodeid tags (positional args)
             tags_to_manage = [tag] if tag else ClbossTags.ALL
             
             for t in tags_to_manage:
                 try:
                     self.plugin.rpc.call(
                         "clboss-manage",
-                        {
-                            "node_id": peer_id,
-                            "tags": t
-                        }
+                        [peer_id, t]  # positional: nodeid, tags
                     )
                 except RpcError as e:
                     # Ignore errors for individual tags

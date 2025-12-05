@@ -159,11 +159,14 @@ class FlowAnalyzer:
         
         self.plugin.log(f"Analyzing flow for {len(channels)} channels")
         
-        # Get flow data (from bookkeeper or listforwards)
-        if self.is_bookkeeper_available():
-            flow_data = self._get_flow_from_bookkeeper()
-        else:
-            flow_data = self._get_flow_from_listforwards()
+        # Get flow data from listforwards (most reliable source with correct channel IDs)
+        # Note: bookkeeper uses funding_txid as account, not short_channel_id
+        # listforwards uses short_channel_id which matches our channel identifiers
+        flow_data = self._get_flow_from_listforwards()
+        
+        # Debug: log how much flow data we got
+        channels_with_flow = sum(1 for v in flow_data.values() if v.get("in", 0) > 0 or v.get("out", 0) > 0)
+        self.plugin.log(f"Flow data: {len(flow_data)} channels tracked, {channels_with_flow} with non-zero flow")
         
         # Analyze each channel
         for channel in channels:
@@ -172,22 +175,36 @@ class FlowAnalyzer:
                 continue
             
             peer_id = channel.get("peer_id", "")
-            capacity = channel.get("capacity_msat", 0) // 1000  # Convert to sats
+            
+            # Calculate capacity - may be null in some CLN versions
+            capacity_msat = channel.get("capacity_msat")
+            if capacity_msat is None or capacity_msat == 0:
+                # Calculate from spendable + receivable (approximate)
+                spendable_msat = channel.get("spendable_msat", 0) or 0
+                receivable_msat = channel.get("receivable_msat", 0) or 0
+                capacity = (spendable_msat + receivable_msat) // 1000
+            else:
+                capacity = capacity_msat // 1000
+            
             if capacity == 0:
                 capacity = channel.get("capacity", 0)
+            
+            # Get current balance for fallback inference (already fetched above for capacity calc)
+            our_balance = spendable_msat // 1000
             
             # Get flow data for this channel
             channel_flow = flow_data.get(channel_id, {"in": 0, "out": 0})
             sats_in = channel_flow.get("in", 0)
             sats_out = channel_flow.get("out", 0)
             
-            # Calculate metrics
+            # Calculate metrics (with balance fallback for zero-flow channels)
             metrics = self._calculate_metrics(
                 channel_id=channel_id,
                 peer_id=peer_id,
                 sats_in=sats_in,
                 sats_out=sats_out,
-                capacity=capacity
+                capacity=capacity,
+                our_balance=our_balance
             )
             
             results[channel_id] = metrics
@@ -221,15 +238,25 @@ class FlowAnalyzer:
             return None
         
         peer_id = channel.get("peer_id", "")
-        capacity = channel.get("capacity_msat", 0) // 1000
+        
+        # Calculate capacity - may be null in some CLN versions
+        capacity_msat = channel.get("capacity_msat")
+        spendable_msat = channel.get("spendable_msat", 0) or 0
+        receivable_msat = channel.get("receivable_msat", 0) or 0
+        
+        if capacity_msat is None or capacity_msat == 0:
+            capacity = (spendable_msat + receivable_msat) // 1000
+        else:
+            capacity = capacity_msat // 1000
+        
         if capacity == 0:
             capacity = channel.get("capacity", 0)
         
-        # Get flow data
-        if self.is_bookkeeper_available():
-            flow_data = self._get_flow_from_bookkeeper(channel_id)
-        else:
-            flow_data = self._get_flow_from_listforwards(channel_id)
+        # Get current balance for fallback
+        our_balance = spendable_msat // 1000
+        
+        # Get flow data from listforwards (uses short_channel_id format)
+        flow_data = self._get_flow_from_listforwards(channel_id)
         
         channel_flow = flow_data.get(channel_id, {"in": 0, "out": 0})
         
@@ -238,11 +265,13 @@ class FlowAnalyzer:
             peer_id=peer_id,
             sats_in=channel_flow.get("in", 0),
             sats_out=channel_flow.get("out", 0),
-            capacity=capacity
+            capacity=capacity,
+            our_balance=our_balance
         )
     
     def _calculate_metrics(self, channel_id: str, peer_id: str,
-                          sats_in: int, sats_out: int, capacity: int) -> FlowMetrics:
+                          sats_in: int, sats_out: int, capacity: int,
+                          our_balance: int = 0) -> FlowMetrics:
         """
         Calculate flow metrics and classify a channel.
         
@@ -254,31 +283,63 @@ class FlowAnalyzer:
         - Negative ratio: More sats coming in than going out (SINK)
         - Near zero: Balanced flow
         
+        BALANCE FALLBACK:
+        When there's no flow data (sats_in == 0 and sats_out == 0), we infer
+        the flow state from the current channel balance:
+        - Low outbound (< 30%): Channel has been draining → likely SOURCE
+        - High outbound (> 70%): Channel has been filling → likely SINK
+        - Middle range: BALANCED
+        
+        This allows the PID to make reasonable fee decisions even for new
+        channels or when bookkeeper data is unavailable.
+        
         Args:
             channel_id: Channel identifier
             peer_id: Peer node ID
             sats_in: Total sats routed in
             sats_out: Total sats routed out
             capacity: Channel capacity
+            our_balance: Our current balance (outbound liquidity) for fallback
             
         Returns:
             FlowMetrics with classification
         """
-        # Calculate flow ratio
+        has_flow_data = sats_in > 0 or sats_out > 0
+        
+        # Calculate flow ratio from actual flow data
         if capacity > 0:
             flow_ratio = (sats_out - sats_in) / capacity
         else:
             flow_ratio = 0.0
         
-        # Classify based on thresholds
-        if sats_in == 0 and sats_out == 0:
-            state = ChannelState.UNKNOWN
-        elif flow_ratio > self.config.source_threshold:
-            state = ChannelState.SOURCE
-        elif flow_ratio < self.config.sink_threshold:
-            state = ChannelState.SINK
+        # Classify based on flow data OR balance fallback
+        if has_flow_data:
+            # Use actual flow data for classification
+            if flow_ratio > self.config.source_threshold:
+                state = ChannelState.SOURCE
+            elif flow_ratio < self.config.sink_threshold:
+                state = ChannelState.SINK
+            else:
+                state = ChannelState.BALANCED
         else:
-            state = ChannelState.BALANCED
+            # FALLBACK: Infer from current balance
+            # If we have no flow data, the balance tells us what happened historically
+            outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
+            
+            if outbound_ratio < 0.30:
+                # Low outbound = channel has been draining = SOURCE behavior
+                state = ChannelState.SOURCE
+                # Set a synthetic flow_ratio to reflect this
+                flow_ratio = 0.6  # Above source_threshold
+            elif outbound_ratio > 0.70:
+                # High outbound = channel has been filling = SINK behavior
+                state = ChannelState.SINK
+                # Set a synthetic flow_ratio to reflect this
+                flow_ratio = -0.6  # Below sink_threshold
+            else:
+                # Balanced liquidity = BALANCED
+                state = ChannelState.BALANCED
+                flow_ratio = 0.0
         
         # Calculate daily volume
         total_volume = sats_in + sats_out
@@ -412,14 +473,13 @@ class FlowAnalyzer:
     
     def _get_flow_from_listforwards(self, channel_id: Optional[str] = None) -> Dict[str, Dict[str, int]]:
         """
-        Get flow data from listforwards (fallback method).
+        Get flow data from listforwards.
         
-        listforwards provides basic forward history when bookkeeper
-        is not available.
+        listforwards provides forward history with short_channel_id format
+        which matches our channel identifiers from listpeerchannels.
         
-        WARNING: listforwards can return HUGE datasets on busy nodes!
-        Nodes with 100k+ forwards will see memory spikes and slow queries.
-        Consider installing and enabling bookkeeper plugin for better performance.
+        Note: On very busy nodes with 100k+ forwards, this query can be slow.
+        The time window filter helps limit the data processed.
         
         Args:
             channel_id: Optional specific channel to query
@@ -432,13 +492,6 @@ class FlowAnalyzer:
         # Calculate time window
         window_seconds = self.config.flow_window_days * 86400
         start_time = int(time.time()) - window_seconds
-        
-        # WARNING: Memory bomb potential on busy nodes
-        self.plugin.log(
-            "WARNING: Using listforwards fallback - this can be slow/memory-intensive "
-            "on busy nodes. Consider enabling bookkeeper plugin for better performance.",
-            level='warning'
-        )
         
         try:
             # Query listforwards

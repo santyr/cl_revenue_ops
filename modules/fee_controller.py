@@ -364,20 +364,13 @@ class PIDFeeController:
                 result["message"] = "Dry run - no changes made"
                 return result
             
-            # Use setchannel (newer) or setchannelfee (older)
-            try:
-                self.plugin.rpc.setchannel(
-                    id=channel_id,
-                    feebase=self.config.base_fee_msat,
-                    feeppm=fee_ppm
-                )
-            except RpcError:
-                # Fall back to older command
-                self.plugin.rpc.setchannelfee(
-                    id=channel_id,
-                    base=self.config.base_fee_msat,
-                    ppm=fee_ppm
-                )
+            # Use setchannel command
+            # setchannel id [feebase] [feeppm] [htlcmin] [htlcmax] [enforcedelay] [ignorefeelimits]
+            self.plugin.rpc.setchannel(
+                channel_id,                    # id
+                self.config.base_fee_msat,     # feebase (msat)
+                fee_ppm                        # feeppm
+            )
             
             # Step 3: Record the change
             self.database.record_fee_change(
@@ -473,14 +466,31 @@ class PIDFeeController:
                 
                 channel_id = channel.get("short_channel_id") or channel.get("channel_id")
                 if channel_id:
+                    # Get balance info
+                    spendable_msat = channel.get("spendable_msat", 0) or 0
+                    receivable_msat = channel.get("receivable_msat", 0) or 0
+                    
+                    # Calculate capacity - may be null in some CLN versions
+                    total_msat = channel.get("total_msat") or channel.get("capacity_msat")
+                    if not total_msat:
+                        total_msat = spendable_msat + receivable_msat
+                    
+                    # Get fee info - in newer CLN it's under updates.local
+                    updates = channel.get("updates", {})
+                    local_updates = updates.get("local", {})
+                    
+                    # Try updates.local first, fall back to top-level
+                    fee_base = local_updates.get("fee_base_msat") or channel.get("fee_base_msat", 0)
+                    fee_ppm = local_updates.get("fee_proportional_millionths") or channel.get("fee_proportional_millionths", 0)
+                    
                     channels[channel_id] = {
                         "channel_id": channel_id,
                         "peer_id": channel.get("peer_id", ""),
-                        "capacity": channel.get("total_msat", 0) // 1000,
-                        "spendable_msat": channel.get("spendable_msat", 0),
-                        "receivable_msat": channel.get("receivable_msat", 0),
-                        "fee_base_msat": channel.get("fee_base_msat", 0),
-                        "fee_proportional_millionths": channel.get("fee_proportional_millionths", 0)
+                        "capacity": total_msat // 1000 if total_msat else 0,
+                        "spendable_msat": spendable_msat,
+                        "receivable_msat": receivable_msat,
+                        "fee_base_msat": fee_base,
+                        "fee_proportional_millionths": fee_ppm
                     }
                     
         except RpcError as e:
