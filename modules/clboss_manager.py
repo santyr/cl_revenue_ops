@@ -347,17 +347,15 @@ class ClbossManager:
         Returns:
             True if we can proceed with changes, False if blocked
         """
-        # Check if already unmanaged
-        if database.is_unmanaged(peer_id, tag):
-            return True
-        
-        # Try to unmanage
+        # Always try to unmanage with clboss (it handles "already unmanaged" gracefully)
+        # Don't rely solely on our DB - clboss state may have changed (restart, etc.)
         result = self.unmanage(peer_id, tag)
         
         if result["success"] or result["skipped"]:
-            # Record that we unmanaged (if not skipped)
+            # Record that we unmanaged (if not skipped and not already in DB)
             if result["success"] and not result.get("skipped"):
-                database.record_unmanage(peer_id, tag)
+                if not database.is_unmanaged(peer_id, tag):
+                    database.record_unmanage(peer_id, tag)
             return True
         
         # Failed to unmanage - log and return False
