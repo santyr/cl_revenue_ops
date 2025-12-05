@@ -498,14 +498,16 @@ class EVRebalancer:
         self._pending[candidate.to_channel] = int(time.time())
         
         try:
-            # Step 1: Unmanage from clboss
+            # Step 1: Unmanage from clboss (both fee AND balance)
+            # This tells clboss: "Don't touch fees AND don't rebalance these channels"
+            # ClbossTags.FEE_AND_BALANCE is "lnfee,balance" as comma-separated string
             self.clboss.ensure_unmanaged_for_channel(
                 candidate.from_channel, candidate.from_peer_id,
-                ClbossTags.REBALANCE, self.database
+                ClbossTags.FEE_AND_BALANCE, self.database
             )
             self.clboss.ensure_unmanaged_for_channel(
                 candidate.to_channel, candidate.to_peer_id,
-                ClbossTags.REBALANCE, self.database
+                ClbossTags.FEE_AND_BALANCE, self.database
             )
             
             # Step 2: Record the attempt

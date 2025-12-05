@@ -34,12 +34,21 @@ class ClbossTags:
     
     These correspond to different aspects clboss manages:
     - lnfee: Fee management
-    - rebalance: Liquidity rebalancing
+    - balance: Liquidity rebalancing (NOT "rebalance"!)
+    - open: Channel opening
+    - close: Channel closing
+    
+    Note: clboss-unmanage expects tags as comma-separated string: "lnfee,balance"
     """
     FEE = "lnfee"
-    REBALANCE = "rebalance"
+    BALANCE = "balance"  # This is the correct tag for rebalancing!
+    OPEN = "open"
+    CLOSE = "close"
     
-    ALL = [FEE, REBALANCE]
+    # For fee + rebalance control (most common use case)
+    # Pass as comma-separated string to clboss-unmanage
+    FEE_AND_BALANCE = "lnfee,balance"
+    ALL = "lnfee,balance,open,close"
 
 
 class ClbossManager:
@@ -119,7 +128,7 @@ class ClbossManager:
         Returns:
             Result dict with status and details
         """
-        return self.unmanage(peer_id, ClbossTags.REBALANCE)
+        return self.unmanage(peer_id, ClbossTags.BALANCE)
     
     def unmanage(self, peer_id: str, tag: str) -> Dict[str, Any]:
         """
