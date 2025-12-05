@@ -35,28 +35,28 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│                      cl-revenue-ops Plugin                            │
-├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
+┌──────────────────────────────────────────────────────────────────────┐
+│                      cl-revenue-ops Plugin                           │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
 │  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────────┐  │
 │  │  Flow Analyzer  │  │  Profitability  │  │                      │  │
 │  │  (Sink/Source)  │  │  Analyzer       │  │                      │  │
 │  └────────┬────────┘  └────────┬────────┘  │                      │  │
 │           │                    │           │                      │  │
 │           ▼                    ▼           │                      │  │
-│  ┌─────────────────────────────────────┐   │  ┌──────────────┐   │  │
-│  │         PID Fee Controller          │   │  │  EV          │   │  │
-│  │  (uses flow state + profitability)  │◀──┼──│  Rebalancer  │   │  │
-│  └────────────────┬────────────────────┘   │  └──────┬───────┘   │  │
-│                   │                        │         │           │  │
-│                   ▼                        ▼         ▼           │  │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │                   Clboss Manager                            │    │
-│  │            (Manager-Override Pattern)                       │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│           │                    │                   │                │
-└───────────┼────────────────────┼───────────────────┼────────────────┘
+│  ┌─────────────────────────────────────┐   │  ┌──────────────┐    │  │
+│  │         PID Fee Controller          │   │  │  EV          │    │  │
+│  │  (uses flow state + profitability)  │◀──┼──│  Rebalancer  │    │  │
+│  └────────────────┬────────────────────┘   │  └──────┬───────┘    │  │
+│                   │                        │         │            │  │
+│                   ▼                        ▼         ▼            │  │
+│  ┌─────────────────────────────────────────────────────────────┐  |  │
+│  │                   Clboss Manager                            │  ┘  │
+│  │            (Manager-Override Pattern)                       │     │
+│  └─────────────────────────────────────────────────────────────┘     │
+│           │                    │                   │                 │
+└───────────┼────────────────────┼───────────────────┼─────────────────┘
             ▼                    ▼                   ▼
      ┌──────────┐         ┌──────────┐        ┌──────────┐
      │ clboss   │         │ setchan  │        │ circular │
@@ -224,7 +224,7 @@ Every 30 minutes (configurable), the plugin:
 1. Calculates error: `Error = TargetFlow - ActualFlow`
 2. Applies PID formula: `Output = Kp*error + Ki*integral + Kd*derivative`
 3. Adjusts fees based on output and liquidity level
-4. Enforces floor (using live `feerates` RPC for dynamic chain cost estimates) and ceiling
+4. Enforces floor (economic minimum) and ceiling
 
 ### EV Rebalancing
 
@@ -234,12 +234,10 @@ Every 15 minutes (configurable), the plugin:
 2. **CRITICAL: Checks flow state first**
    - If target is a **SINK**: SKIP (it fills itself for free!)
    - If target is a **SOURCE**: HIGH PRIORITY (keep it full!)
-3. Estimates inbound fees using `getroute` probes (or historical data, or peer gossip)
-4. Calculates spread: `Spread = OutboundFeePPM - InboundFeePPM`
-5. Computes max fee as PPM: `MaxPPM = (MaxBudget / Amount) * 1,000,000`
-6. Selects source channel considering peer connection status and reliability
-7. Only executes if spread is positive and profit > minimum
-8. Calls circular via RPC with strict `maxppm` constraint
+3. Calculates spread: `Spread = OutboundFeePPM - InboundFeePPM`
+4. Computes max fee as PPM: `MaxPPM = (MaxBudget / Amount) * 1,000,000`
+5. Only executes if spread is positive and profit > minimum
+6. Calls circular via RPC with strict `maxppm` constraint
 
 ### Circular Integration (Strategist & Driver Pattern)
 
