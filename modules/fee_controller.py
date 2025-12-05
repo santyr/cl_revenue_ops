@@ -252,9 +252,19 @@ class PIDFeeController:
         bucket = LiquidityBuckets.get_bucket(outbound_ratio)
         liquidity_multiplier = LiquidityBuckets.get_fee_multiplier(bucket)
         
+        # Apply flow state bias
+        # SOURCE channels are money printers (draining) - charge higher fees (scarce)
+        # SINK channels fill for free - lower fees to encourage outflow
+        flow_state = state.get("state", "balanced")
+        flow_state_multiplier = 1.0
+        if flow_state == "source":
+            flow_state_multiplier = 1.25  # 25% higher fees for sources
+        elif flow_state == "sink":
+            flow_state_multiplier = 0.80  # 20% lower fees for sinks
+        
         # Calculate new fee
         base_fee = current_fee_ppm + fee_adjustment
-        new_fee_ppm = int(base_fee * liquidity_multiplier)
+        new_fee_ppm = int(base_fee * liquidity_multiplier * flow_state_multiplier)
         
         # Apply floor and ceiling
         floor_ppm = self._calculate_floor(capacity)
@@ -275,10 +285,9 @@ class PIDFeeController:
             self._save_pid_state(channel_id, pid_state)
             return None
         
-        # Build reason string
-        flow_state = state.get("state", "unknown")
+        # Build reason string (flow_state already defined above for multiplier)
         reason = (f"PID adjustment: flow={daily_volume}/day (target={target_flow}), "
-                 f"state={flow_state}, liquidity={bucket} ({outbound_ratio:.0%})")
+                 f"state={flow_state} (x{flow_state_multiplier}), liquidity={bucket} ({outbound_ratio:.0%})")
         
         # Apply the fee change
         result = self.set_channel_fee(channel_id, new_fee_ppm, reason=reason)

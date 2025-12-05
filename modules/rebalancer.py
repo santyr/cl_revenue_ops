@@ -225,8 +225,16 @@ class EVRebalancer:
             if candidate:
                 candidates.append(candidate)
         
-        # Sort by expected profit (highest first)
-        candidates.sort(key=lambda c: c.expected_profit_sats, reverse=True)
+        # Sort by priority: SOURCE channels first (they're money printers!), then by profit
+        # SOURCE channels get a priority boost since keeping them full is critical
+        def sort_key(c):
+            dest_state = self.database.get_channel_state(c.dest_channel_id)
+            flow_state = dest_state.get("state", "balanced") if dest_state else "balanced"
+            # SOURCE = 2 (highest priority), BALANCED = 1, SINK should never appear here
+            priority = 2 if flow_state == "source" else 1
+            return (priority, c.expected_profit_sats)
+        
+        candidates.sort(key=sort_key, reverse=True)
         
         return candidates
     
@@ -298,6 +306,15 @@ class EVRebalancer:
         # Calculate spread
         spread_ppm = outbound_fee_ppm - inbound_fee_ppm
         
+        # CRITICAL: Check spread FIRST before any calculations
+        # If spread is negative, we LOSE money on every rebalance!
+        if spread_ppm <= 0:
+            self.plugin.log(
+                f"Skipping {dest_channel}: negative/zero spread "
+                f"(outbound={outbound_fee_ppm}ppm, inbound={inbound_fee_ppm}ppm, spread={spread_ppm}ppm)"
+            )
+            return None
+        
         # Calculate max budget (what we can pay and still profit)
         # max_budget = spread * amount / 1_000_000
         max_budget_sats = (spread_ppm * rebalance_amount) // 1_000_000
@@ -311,6 +328,13 @@ class EVRebalancer:
         else:
             max_fee_ppm = 0
         
+        # Check if max_fee_ppm is reasonable
+        if max_fee_ppm <= 0:
+            self.plugin.log(
+                f"Skipping {dest_channel}: max_fee_ppm is zero or negative"
+            )
+            return None
+        
         # Calculate expected profit (conservative estimate)
         # Assume we'll route ~10% of the amount we rebalance before needing to rebalance again
         utilization_estimate = 0.10
@@ -320,24 +344,11 @@ class EVRebalancer:
         # Estimated profit = expected income - max budget (worst case fee)
         expected_profit = expected_fee_income - max_budget_sats
         
-        # Check if profitable
+        # Check if profitable enough to bother
         if max_budget_sats < self.config.rebalance_min_profit:
             self.plugin.log(
                 f"Skipping {dest_channel}: spread too small "
-                f"(max_budget={max_budget_sats} < min={self.config.rebalance_min_profit})"
-            )
-            return None
-        
-        if spread_ppm <= 0:
-            self.plugin.log(
-                f"Skipping {dest_channel}: negative spread "
-                f"(outbound={outbound_fee_ppm}, inbound={inbound_fee_ppm})"
-            )
-            return None
-        
-        if max_fee_ppm <= 0:
-            self.plugin.log(
-                f"Skipping {dest_channel}: max_fee_ppm is zero or negative"
+                f"(max_budget={max_budget_sats}sats < min={self.config.rebalance_min_profit}sats)"
             )
             return None
         
