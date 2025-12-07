@@ -66,6 +66,10 @@ class Config:
     # Profitability tracking
     estimated_open_cost_sats: int = 5000  # Estimated on-chain fee for channel open
     
+    # Global Capital Controls
+    daily_budget_sats: int = 5000          # Max rebalancing fees per 24h period
+    min_wallet_reserve: int = 1_000_000    # Min sats (on-chain + receivable) before ABORT
+    
     # Safety flags
     dry_run: bool = False          # If True, log but don't execute
 

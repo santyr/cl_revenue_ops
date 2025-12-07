@@ -492,6 +492,28 @@ class Database:
             return row['last_time']
         return None
     
+    def get_total_rebalance_fees(self, since_timestamp: int) -> int:
+        """
+        Get the total rebalancing fees spent since a given timestamp.
+        
+        Used for Global Capital Controls to enforce daily budget limits.
+        Sums actual_fee_sats from successful rebalances since the timestamp.
+        
+        Args:
+            since_timestamp: Unix timestamp to start summing from
+            
+        Returns:
+            Total fees spent in sats (0 if none)
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT COALESCE(SUM(actual_fee_sats), 0) as total_fees
+            FROM rebalance_history 
+            WHERE timestamp >= ? AND status = 'success' AND actual_fee_sats IS NOT NULL
+        """, (since_timestamp,)).fetchone()
+        
+        return row['total_fees'] if row else 0
+    
     def get_rebalance_history_by_peer(self, peer_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
         Get rebalance history for channels belonging to a specific peer.

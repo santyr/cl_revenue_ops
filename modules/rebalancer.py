@@ -204,6 +204,10 @@ class EVRebalancer:
         """
         candidates = []
         
+        # GLOBAL CAPITAL CONTROLS: Check wallet reserve and daily budget
+        if not self._check_capital_controls():
+            return candidates
+        
         # Get current channel states
         channels = self._get_channels_with_balances()
         
@@ -1343,6 +1347,96 @@ class EVRebalancer:
             )
         
         return self.execute_rebalance(candidate)
+    
+    def _check_capital_controls(self) -> bool:
+        """
+        Check Global Capital Controls before allowing rebalancing.
+        
+        This prevents over-spending by:
+        1. Checking if total wallet reserve (on-chain + channel receivable) is above minimum
+        2. Checking if daily rebalancing budget has been exceeded
+        
+        Returns:
+            True if rebalancing is allowed, False if capital controls block it
+        """
+        # Check 1: Minimum Wallet Reserve
+        # If total spendable (on-chain + channel receivable) < min_wallet_reserve, ABORT
+        try:
+            listfunds = self.plugin.rpc.listfunds()
+            
+            # Sum on-chain spendable (confirmed outputs)
+            onchain_sats = 0
+            for output in listfunds.get("outputs", []):
+                if output.get("status") == "confirmed":
+                    amount_msat = output.get("amount_msat", 0)
+                    if isinstance(amount_msat, str):
+                        # Handle "123456msat" format
+                        amount_msat = int(amount_msat.replace("msat", ""))
+                    onchain_sats += amount_msat // 1000
+            
+            # Sum channel spendable (our local balance - this is OUR money)
+            channel_spendable_sats = 0
+            for channel in listfunds.get("channels", []):
+                if channel.get("state") != "CHANNELD_NORMAL":
+                    continue
+                our_amount_msat = channel.get("our_amount_msat", 0)
+                if isinstance(our_amount_msat, str):
+                    our_amount_msat = int(our_amount_msat.replace("msat", ""))
+                # Spendable = our_amount (This is Our Money, which pays the fees)
+                spendable = our_amount_msat // 1000
+                if spendable > 0:
+                    channel_spendable_sats += spendable
+            
+            total_reserve = onchain_sats + channel_spendable_sats
+            min_reserve = self.config.min_wallet_reserve
+            
+            if total_reserve < min_reserve:
+                self.plugin.log(
+                    f"CAPITAL CONTROL: Wallet reserve too low! "
+                    f"on-chain={onchain_sats:,} + channel_spendable={channel_spendable_sats:,} = "
+                    f"{total_reserve:,} sats < min_reserve={min_reserve:,} sats. "
+                    f"ABORTING all rebalancing operations.",
+                    level='warning'
+                )
+                return False
+            
+        except RpcError as e:
+            self.plugin.log(f"Error checking wallet reserve: {e}", level='error')
+            # Fail-safe: allow rebalancing if we can't check
+            self.plugin.log("Continuing with rebalance (could not verify reserve)")
+        
+        # Check 2: Daily Budget
+        # Sum fees spent in last 24 hours, abort if over budget
+        try:
+            now = int(time.time())
+            twenty_four_hours_ago = now - (24 * 60 * 60)
+            
+            fees_spent_24h = self.database.get_total_rebalance_fees(twenty_four_hours_ago)
+            daily_budget = self.config.daily_budget_sats
+            
+            if fees_spent_24h >= daily_budget:
+                self.plugin.log(
+                    f"CAPITAL CONTROL: Daily rebalancing budget exceeded! "
+                    f"Spent {fees_spent_24h:,} sats in last 24h >= budget of {daily_budget:,} sats. "
+                    f"ABORTING rebalancing until budget resets.",
+                    level='warning'
+                )
+                return False
+            
+            # Log remaining budget
+            remaining = daily_budget - fees_spent_24h
+            self.plugin.log(
+                f"Capital controls OK: {fees_spent_24h:,}/{daily_budget:,} sats spent, "
+                f"{remaining:,} sats remaining in daily budget",
+                level='debug'
+            )
+            
+        except Exception as e:
+            self.plugin.log(f"Error checking daily budget: {e}", level='error')
+            # Fail-safe: allow rebalancing if we can't check
+            self.plugin.log("Continuing with rebalance (could not verify budget)")
+        
+        return True
     
     def _get_channels_with_balances(self) -> Dict[str, Dict[str, Any]]:
         """

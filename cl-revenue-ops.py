@@ -151,6 +151,18 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-daily-budget-sats',
+    default='5000',
+    description='Max rebalancing fees to spend in 24 hours (default: 5000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-min-wallet-reserve',
+    default='1000000',
+    description='Minimum total funds (on-chain + off-chain) to keep in reserve (default: 1,000,000)'
+)
+
+plugin.add_option(
     name='revenue-ops-dry-run',
     default='false',
     description='If true, log actions but do not execute (default: false)'
@@ -192,6 +204,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_window_days=int(options['revenue-ops-flow-window-days']),
         clboss_enabled=options['revenue-ops-clboss-enabled'].lower() == 'true',
         rebalancer_plugin=options['revenue-ops-rebalancer'],
+        daily_budget_sats=int(options['revenue-ops-daily-budget-sats']),
+        min_wallet_reserve=int(options['revenue-ops-min-wallet-reserve']),
         dry_run=options['revenue-ops-dry-run'].lower() == 'true'
     )
     
