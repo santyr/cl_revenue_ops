@@ -130,6 +130,7 @@ class HillClimbingFeeController:
     MAX_CONSECUTIVE = 5     # Max consecutive moves in same direction before reducing step
     DAMPENING_FACTOR = 0.8  # Step size decay factor on direction reversal (wiggle dampening)
     MIN_OBSERVATION_HOURS = 1.0  # Minimum hours between fee changes for valid signal
+    VOLATILITY_THRESHOLD = 0.50  # 50% change in revenue rate triggers volatility reset
     
     def __init__(self, plugin: Plugin, config: Config, database: Database, 
                  clboss_manager: ClbossManager,
@@ -317,6 +318,29 @@ class HillClimbingFeeController:
         if step_ppm <= 0:
             step_ppm = self.STEP_PPM  # Reset to default if invalid
         
+        # VOLATILITY RESET: Detect large revenue shifts and reset step size
+        # If revenue rate changed by more than VOLATILITY_THRESHOLD (50%), the demand
+        # curve has likely shifted significantly. A small dampened step (e.g., 10ppm)
+        # won't adapt fast enough - we need to explore aggressively again.
+        volatility_reset = False
+        if hc_state.last_update > 0 and hc_state.last_revenue_rate > 0:
+            # Calculate percentage change in revenue rate (division-by-zero safe)
+            delta = abs(current_revenue_rate - hc_state.last_revenue_rate)
+            change_ratio = delta / max(1.0, hc_state.last_revenue_rate)
+            
+            if change_ratio > self.VOLATILITY_THRESHOLD:
+                # Large shift detected - reset step to default for aggressive exploration
+                old_step = step_ppm
+                step_ppm = self.STEP_PPM
+                volatility_reset = True
+                self.plugin.log(
+                    f"VOLATILITY RESET {channel_id[:12]}...: revenue rate changed by "
+                    f"{change_ratio:.0%} (from {hc_state.last_revenue_rate:.2f} to "
+                    f"{current_revenue_rate:.2f} sats/hr). Resetting step from "
+                    f"{old_step}ppm to {step_ppm}ppm for aggressive exploration.",
+                    level='info'
+                )
+        
         # Determine new direction based on revenue rate change
         if hc_state.last_update == 0:
             # First run - start by trying to increase (default direction)
@@ -384,7 +408,8 @@ class HillClimbingFeeController:
             return None
         
         # Build reason string (with rate info)
-        reason = (f"HillClimb: rate={current_revenue_rate:.2f}sats/hr ({decision_reason}), "
+        volatility_note = " [VOLATILITY_RESET]" if volatility_reset else ""
+        reason = (f"HillClimb: rate={current_revenue_rate:.2f}sats/hr ({decision_reason}){volatility_note}, "
                  f"direction={'up' if new_direction > 0 else 'down'}, "
                  f"step={step_ppm}ppm, state={flow_state}, "
                  f"liquidity={bucket} ({outbound_ratio:.0%}), "
@@ -408,7 +433,8 @@ class HillClimbingFeeController:
                     "hours_elapsed": hours_elapsed,
                     "direction": new_direction,
                     "step_ppm": step_ppm,
-                    "consecutive_same_direction": hc_state.consecutive_same_direction
+                    "consecutive_same_direction": hc_state.consecutive_same_direction,
+                    "volatility_reset": volatility_reset
                 }
             )
         

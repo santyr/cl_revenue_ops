@@ -191,6 +191,16 @@ class Database:
             )
         """)
         
+        # Channel failure tracking for adaptive backoff (persisted across restarts)
+        # This prevents "retry storms" after plugin restart
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_failures (
+                channel_id TEXT PRIMARY KEY,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_failure_time INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        
         # Create indexes for common queries
         conn.execute("CREATE INDEX IF NOT EXISTS idx_flow_history_channel ON flow_history(channel_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fee_changes_channel ON fee_changes(channel_id, timestamp)")
@@ -746,18 +756,120 @@ class Database:
         return result
     
     # =========================================================================
+    # Channel Failure Tracking Methods (Persistent Backoff)
+    # =========================================================================
+    
+    def get_failure_count(self, channel_id: str) -> Tuple[int, int]:
+        """
+        Get the failure count and last failure time for a channel.
+        
+        Used by the rebalancer for adaptive backoff logic.
+        
+        Args:
+            channel_id: Channel to query
+            
+        Returns:
+            Tuple of (failure_count, last_failure_time)
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT failure_count, last_failure_time FROM channel_failures WHERE channel_id = ?",
+            (channel_id,)
+        ).fetchone()
+        
+        if row:
+            return (row["failure_count"], row["last_failure_time"])
+        return (0, 0)
+    
+    def increment_failure_count(self, channel_id: str) -> int:
+        """
+        Increment the failure count for a channel and update last failure time.
+        
+        Called when a rebalance attempt fails.
+        
+        Args:
+            channel_id: Channel that failed
+            
+        Returns:
+            New failure count
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        
+        # Get current count
+        current_count, _ = self.get_failure_count(channel_id)
+        new_count = current_count + 1
+        
+        conn.execute("""
+            INSERT OR REPLACE INTO channel_failures 
+            (channel_id, failure_count, last_failure_time)
+            VALUES (?, ?, ?)
+        """, (channel_id, new_count, now))
+        
+        return new_count
+    
+    def reset_failure_count(self, channel_id: str) -> None:
+        """
+        Reset the failure count for a channel (e.g., after successful rebalance).
+        
+        Args:
+            channel_id: Channel to reset
+        """
+        conn = self._get_connection()
+        conn.execute(
+            "DELETE FROM channel_failures WHERE channel_id = ?",
+            (channel_id,)
+        )
+    
+    def get_all_failure_counts(self) -> Dict[str, Tuple[int, int]]:
+        """
+        Get failure counts for all channels with recorded failures.
+        
+        Returns:
+            Dict mapping channel_id to (failure_count, last_failure_time)
+        """
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM channel_failures").fetchall()
+        return {row["channel_id"]: (row["failure_count"], row["last_failure_time"]) for row in rows}
+    
+    # =========================================================================
     # Cleanup Methods
     # =========================================================================
     
-    def cleanup_old_data(self, days_to_keep: int = 30):
-        """Remove old data to prevent database bloat."""
+    def cleanup_old_data(self, days_to_keep: int = 8):
+        """
+        Remove old data to prevent database bloat.
+        
+        AGGRESSIVE PRUNING (Day 2 Task 3):
+        The forwards table grows very fast on high-traffic nodes. We only need
+        data for the flow_window_days (default 7 days), so we default to keeping
+        8 days (7 + 1 buffer) instead of the previous 30 days.
+        
+        The caller (cl-revenue-ops.py) should pass max(8, config.flow_window_days + 1)
+        to ensure we keep enough data for flow analysis while preventing bloat.
+        
+        Args:
+            days_to_keep: Number of days of data to retain (default 8)
+        """
         conn = self._get_connection()
         cutoff = int(time.time()) - (days_to_keep * 86400)
+        
+        # Count rows before deletion for logging
+        flow_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM flow_history WHERE timestamp < ?", (cutoff,)
+        ).fetchone()["cnt"]
+        forwards_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM forwards WHERE timestamp < ?", (cutoff,)
+        ).fetchone()["cnt"]
         
         conn.execute("DELETE FROM flow_history WHERE timestamp < ?", (cutoff,))
         conn.execute("DELETE FROM forwards WHERE timestamp < ?", (cutoff,))
         
-        self.plugin.log(f"Cleaned up data older than {days_to_keep} days")
+        if flow_count > 0 or forwards_count > 0:
+            self.plugin.log(
+                f"Cleaned up data older than {days_to_keep} days: "
+                f"{flow_count} flow_history rows, {forwards_count} forwards rows"
+            )
     
     def close(self):
         """Close the database connection."""

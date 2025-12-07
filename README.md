@@ -18,6 +18,7 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - Uses **rate-based feedback** (revenue per hour) instead of absolute revenue for faster response
 - Actively seeks the optimal fee point where `Revenue = Volume × Fee` is maximized
 - Includes **wiggle dampening** to reduce step size on direction reversals
+- **Volatility reset**: Detects large revenue shifts (>50%) and resets step size for aggressive re-exploration
 - Applies profitability multipliers based on channel health
 - Never drops below economic floor (based on channel costs)
 
@@ -28,6 +29,7 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
   - SOURCE channels: Target 85% outbound (keep them full to earn)
   - BALANCED channels: Target 50% outbound (standard equilibrium)
   - SINK channels: Target 15% outbound (they fill themselves for free)
+- **Persistent failure tracking**: Failure counts survive plugin restarts (prevents retry storms)
 - **Last Hop Cost estimation**: Uses `listchannels` to get peer's actual fee policy toward us
 - **Adaptive failure backoff**: Exponential cooldown for channels that keep failing
 - Sets strict budget caps to ensure profitability

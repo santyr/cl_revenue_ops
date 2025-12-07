@@ -163,9 +163,9 @@ class EVRebalancer:
         # Track pending rebalances to avoid duplicates
         self._pending: Dict[str, int] = {}  # channel_id -> timestamp
         
-        # Track consecutive failures for adaptive backoff (Task 3)
-        # Maps channel_id -> failure_count
-        self._failure_counts: Dict[str, int] = {}
+        # NOTE: Failure counts are now persisted to database (channel_failures table)
+        # to survive plugin restarts and prevent "retry storms"
+        # Use self.database.get_failure_count(), increment_failure_count(), etc.
         
         # Cache our node ID (fetched lazily on first use)
         self._our_node_id: Optional[str] = None
@@ -1069,8 +1069,8 @@ class EVRebalancer:
                 result["actual_profit_sats"] = actual_profit
                 result["message"] = "Rebalance completed successfully"
                 
-                # ADAPTIVE BACKOFF: Reset failure count on success
-                self._failure_counts[candidate.to_channel] = 0
+                # ADAPTIVE BACKOFF: Reset failure count on success (persisted to DB)
+                self.database.reset_failure_count(candidate.to_channel)
                 
                 # ANTI-THRASHING: Keep clboss unmanaged for extended period
                 # This prevents clboss from immediately "fixing" the balance
@@ -1088,18 +1088,17 @@ class EVRebalancer:
                 )
                 result["message"] = f"Rebalance failed: {error}"
                 
-                # ADAPTIVE BACKOFF: Increment failure count
-                current_failures = self._failure_counts.get(candidate.to_channel, 0)
-                self._failure_counts[candidate.to_channel] = current_failures + 1
+                # ADAPTIVE BACKOFF: Increment failure count (persisted to DB)
+                new_failure_count = self.database.increment_failure_count(candidate.to_channel)
                 
                 # Calculate next backoff time for logging
                 base_cooldown = 600  # 10 minutes base
-                next_cooldown = base_cooldown * (2 ** (current_failures + 1))
+                next_cooldown = base_cooldown * (2 ** new_failure_count)
                 next_cooldown_mins = next_cooldown // 60
                 
                 self.plugin.log(
                     f"Rebalance failed: {error}. "
-                    f"Failure #{current_failures + 1} for {candidate.to_channel[:12]}..., "
+                    f"Failure #{new_failure_count} for {candidate.to_channel[:12]}..., "
                     f"next attempt backoff: {next_cooldown_mins} minutes",
                     level='warn'
                 )
@@ -1108,9 +1107,8 @@ class EVRebalancer:
             result["message"] = f"Error: {str(e)}"
             self.plugin.log(f"Error executing rebalance: {e}", level='error')
             
-            # ADAPTIVE BACKOFF: Also count exceptions as failures
-            current_failures = self._failure_counts.get(candidate.to_channel, 0)
-            self._failure_counts[candidate.to_channel] = current_failures + 1
+            # ADAPTIVE BACKOFF: Also count exceptions as failures (persisted to DB)
+            self.database.increment_failure_count(candidate.to_channel)
         finally:
             # Clear pending status after some time
             pass
@@ -1412,6 +1410,10 @@ class EVRebalancer:
         - 3 failures: 80 min (10 * 2^3)
         - etc.
         
+        PERSISTENCE (Day 2 Task 2):
+        Failure counts are now stored in the database (channel_failures table)
+        to survive plugin restarts and prevent "retry storms" on broken channels.
+        
         This prevents wasting resources on "stuck" channels that keep failing,
         while still allowing quick retries for channels that just had a one-off issue.
         
@@ -1425,8 +1427,8 @@ class EVRebalancer:
         if pending_time == 0:
             return False
         
-        # Calculate dynamic cooldown based on failure count
-        failure_count = self._failure_counts.get(channel_id, 0)
+        # Get failure count from database (persistent across restarts)
+        failure_count, _ = self.database.get_failure_count(channel_id)
         base_cooldown = 600  # 10 minutes base
         
         # Exponential backoff: base * 2^failures
@@ -1487,15 +1489,14 @@ class EVRebalancer:
         Args:
             channel_id: Channel to reset
         """
-        if channel_id in self._failure_counts:
-            del self._failure_counts[channel_id]
-            self.plugin.log(f"Reset failure count for {channel_id}")
+        self.database.reset_failure_count(channel_id)
+        self.plugin.log(f"Reset failure count for {channel_id}")
     
-    def get_failure_counts(self) -> Dict[str, int]:
+    def get_failure_counts(self) -> Dict[str, Tuple[int, int]]:
         """
         Get all current failure counts.
         
         Returns:
-            Dict mapping channel_id to failure count
+            Dict mapping channel_id to (failure_count, last_failure_time)
         """
-        return dict(self._failure_counts)
+        return self.database.get_all_failure_counts()

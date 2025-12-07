@@ -230,8 +230,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 
                 # Run cleanup on each iteration (it's a fast DELETE query)
                 # Keeps history tables from growing unbounded over months
+                # Use flow_window_days + 1 day buffer, minimum 8 days
                 if database:
-                    database.cleanup_old_data(days_to_keep=30)
+                    days_to_keep = max(8, config.flow_window_days + 1)
+                    database.cleanup_old_data(days_to_keep=days_to_keep)
                     
             except Exception as e:
                 plugin.log(f"Error in flow analysis: {e}", level='error')
