@@ -83,13 +83,21 @@ class ChannelProfitability:
         capacity_sats: Channel capacity
         costs: Cost breakdown
         revenue: Revenue breakdown
-        net_profit_sats: Revenue - Costs
-        roi_percent: Return on investment percentage
+        net_profit_sats: Revenue - Costs (Total/Accounting view)
+        roi_percent: Return on investment percentage (Total ROI - includes open cost)
         classification: Profitability class
         cost_per_sat_routed: Average cost per sat of volume
         fee_per_sat_routed: Average fee earned per sat of volume
         days_open: How long the channel has been open
         last_routed: Timestamp of last routing activity
+    
+    Important Distinction:
+        - roi_percent (Total ROI): Accounting view including sunk costs (open_cost_sats)
+        - marginal_roi: Operational view - only considers ongoing costs (rebalance_costs)
+        
+    The marginal_roi is what matters for operational decisions:
+    A channel that is covering its rebalancing costs is operationally profitable,
+    even if it hasn't "paid back" the initial opening cost (sunk cost fallacy).
     """
     channel_id: str
     peer_id: str
@@ -104,6 +112,50 @@ class ChannelProfitability:
     days_open: int
     last_routed: Optional[int]
     
+    @property
+    def marginal_roi(self) -> float:
+        """
+        Calculate Marginal ROI (Operational profitability).
+        
+        This metric EXCLUDES open_cost_sats (sunk cost) and focuses only on
+        operational profitability: are we covering our rebalancing costs?
+        
+        Formula: (fees_earned - rebalance_costs) / max(1, rebalance_costs)
+        
+        Returns:
+            Marginal ROI as a decimal (e.g., 0.5 = 50% marginal return)
+            Returns 1.0 if no rebalance costs and earning fees (infinitely profitable operationally)
+            Returns 0.0 if no rebalance costs and no fees (neutral)
+        """
+        fees_earned = self.revenue.fees_earned_sats
+        rebalance_costs = self.costs.rebalance_cost_sats
+        
+        # If no rebalancing has occurred, check if channel is earning
+        if rebalance_costs == 0:
+            # No operational costs - if earning anything, it's pure profit
+            return 1.0 if fees_earned > 0 else 0.0
+        
+        # Marginal profit = fees earned minus rebalancing costs (NO open cost!)
+        marginal_profit = fees_earned - rebalance_costs
+        
+        # ROI relative to rebalancing investment
+        return marginal_profit / max(1, rebalance_costs)
+    
+    @property
+    def marginal_roi_percent(self) -> float:
+        """Marginal ROI as a percentage."""
+        return self.marginal_roi * 100
+    
+    @property
+    def is_operationally_profitable(self) -> bool:
+        """
+        Check if channel is operationally profitable (covering rebalance costs).
+        
+        This is the key metric for fee decisions - we should NOT penalize channels
+        just because they haven't paid back their opening cost.
+        """
+        return self.marginal_roi >= 0
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
             "channel_id": self.channel_id,
@@ -117,6 +169,8 @@ class ChannelProfitability:
             "forward_count": self.revenue.forward_count,
             "net_profit_sats": self.net_profit_sats,
             "roi_percent": round(self.roi_percent, 2),
+            "marginal_roi_percent": round(self.marginal_roi_percent, 2),
+            "is_operationally_profitable": self.is_operationally_profitable,
             "classification": self.classification.value,
             "cost_per_sat_routed": round(self.cost_per_sat_routed, 6),
             "fee_per_sat_routed": round(self.fee_per_sat_routed, 6),
@@ -298,10 +352,18 @@ class ChannelProfitabilityAnalyzer:
     
     def get_fee_multiplier(self, channel_id: str) -> float:
         """
-        Get fee multiplier based on channel profitability.
+        Get fee multiplier based on channel's MARGINAL (operational) profitability.
         
-        Profitable channels can afford competitive fees.
-        Underwater channels may need higher fees to recover.
+        CRITICAL: Uses marginal_roi, NOT total ROI.
+        
+        This avoids the SUNK COST FALLACY:
+        - A channel should NOT be penalized with high fees just because
+          it had a high opening cost that hasn't been recovered yet.
+        - What matters operationally is: Is this channel covering its
+          ONGOING costs (rebalancing) with its fee revenue?
+        
+        If a channel is operationally profitable (marginal_roi >= 0),
+        it's working well and should keep competitive fees to maintain volume.
         
         Args:
             channel_id: Channel to get multiplier for
@@ -314,15 +376,45 @@ class ChannelProfitabilityAnalyzer:
         if not profitability:
             return 1.0  # No data, no adjustment
         
-        # Multipliers based on classification
-        multipliers = {
-            ProfitabilityClass.PROFITABLE: 0.95,    # Slight discount, keep volume
-            ProfitabilityClass.BREAK_EVEN: 1.0,     # No change
-            ProfitabilityClass.UNDERWATER: 1.1,     # Try to recover some costs
-            ProfitabilityClass.ZOMBIE: 1.0,         # Don't bother, flag for closure
-        }
+        # Use MARGINAL ROI for operational decisions
+        # This ignores sunk costs (open_cost_sats)
+        marginal_roi = profitability.marginal_roi
         
-        return multipliers.get(profitability.classification, 1.0)
+        # Fee multipliers based on operational profitability
+        if marginal_roi > 0.20:  # > 20% marginal return
+            # Highly profitable operationally - keep fees competitive
+            return 0.95
+        elif marginal_roi >= 0:  # Breaking even or better on operations
+            # Covering costs - no change needed
+            return 1.0
+        elif marginal_roi >= -0.20:  # -20% to 0 marginal return
+            # Slight operational loss - modest fee increase
+            return 1.05
+        elif marginal_roi >= -0.50:  # -50% to -20% marginal return
+            # Significant operational loss - larger fee increase
+            return 1.10
+        else:  # < -50% marginal return
+            # Severe operational loss - check if zombie
+            if profitability.classification == ProfitabilityClass.ZOMBIE:
+                return 1.0  # Don't bother adjusting zombies, flag for closure
+            return 1.15  # Try to recover operational costs
+    
+    def get_marginal_roi(self, channel_id: str) -> Optional[float]:
+        """
+        Get the marginal ROI for a channel.
+        
+        This is the operational profitability metric that excludes sunk costs.
+        
+        Args:
+            channel_id: Channel to get marginal ROI for
+            
+        Returns:
+            Marginal ROI as decimal, or None if no data
+        """
+        profitability = self.get_profitability(channel_id)
+        if not profitability:
+            return None
+        return profitability.marginal_roi
     
     def get_rebalance_priority(self, channel_id: str) -> float:
         """

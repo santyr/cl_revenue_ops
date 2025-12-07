@@ -1,7 +1,7 @@
 """
 EV-Based Rebalancer module for cl-revenue-ops
 
-MODULE 3: EV-Based Rebalancing (Profit-Aware)
+MODULE 3: EV-Based Rebalancing (Profit-Aware with Opportunity Cost)
 
 This module implements Expected Value (EV) based rebalancing decisions.
 Unlike clboss which often makes negative EV rebalances, this module only
@@ -18,19 +18,19 @@ Expected Value Theory for Rebalancing:
 - Rebalancing moves liquidity from one channel to another
 - It costs fees to move the liquidity
 - It earns potential future routing fees from the refilled channel
-- EV = Expected_Future_Fees - Rebalancing_Cost
+- BUT: Draining the source channel has an OPPORTUNITY COST
+- EV = Expected_Future_Fees - Rebalancing_Cost - Opportunity_Cost
 
-EV Calculation:
-1. Calculate Spread = OutboundFeePPM - InboundFeePPM
-   - OutboundFeePPM: Fee we charge to route out of depleted channel
-   - InboundFeePPM: Fee peers charge to route into our node (cost to refill)
-
-2. MaxBudget = Spread * RebalanceAmount / 1_000_000
-   - This is the maximum we can pay and still be profitable
-
-3. Execution Decision:
-   - If MaxBudget > MinProfit: Execute rebalance with budget cap
-   - If MaxBudget <= MinProfit: Skip (negative or insufficient EV)
+NEW: Dynamic Utilization & Opportunity Cost:
+1. OLD: Static 10% utilization estimate (unrealistic)
+2. NEW: Dynamic turnover_rate = daily_volume / capacity
+   - Uses actual channel performance to project revenue
+   
+3. OLD Spread: Dest_Fee - Inbound_Rebalance_Cost
+4. NEW Spread: Dest_Fee - (Inbound_Rebalance_Cost + Source_Fee)
+   - We're "selling" liquidity from Source to "buy" liquidity on Dest
+   - If Source earns 500ppm and Dest earns 600ppm with 200ppm rebalance cost,
+     that's actually a NET LOSS (600 - 200 - 500 = -100ppm)
 
 CRITICAL FLOW STATE LOGIC:
 - If Target Channel is SINK: ABORT rebalance!
@@ -43,8 +43,8 @@ Anti-Thrashing Protection:
 - This prevents clboss from immediately "fixing" our work and wasting fees
 
 The key insight: We should never pay more to rebalance than we expect
-to earn from the restored capacity. This prevents the costly rebalancing
-loops that plague naive automated systems.
+to earn from the restored capacity MINUS the opportunity cost of the
+liquidity we're draining from the source channel.
 """
 
 import time
@@ -75,13 +75,16 @@ class RebalanceCandidate:
         amount_msat: Amount in millisatoshis (for RPC calls)
         outbound_fee_ppm: Fee we charge on destination channel
         inbound_fee_ppm: Estimated fee to route to us
-        spread_ppm: Difference (our fee - their fee)
+        source_fee_ppm: Fee we charge on source channel (opportunity cost)
+        spread_ppm: Net spread after opportunity cost
         max_budget_sats: Maximum fee we should pay
         max_budget_msat: Maximum fee in msat (for RPC calls)
         max_fee_ppm: Maximum fee as PPM (for circular)
         expected_profit_sats: Expected profit if rebalanced
         liquidity_ratio: Current outbound ratio on destination
         dest_flow_state: Flow state of destination (SOURCE/SINK/BALANCED)
+        dest_turnover_rate: Daily volume / capacity for destination
+        source_turnover_rate: Daily volume / capacity for source
     """
     from_channel: str
     to_channel: str
@@ -91,6 +94,7 @@ class RebalanceCandidate:
     amount_msat: int
     outbound_fee_ppm: int
     inbound_fee_ppm: int
+    source_fee_ppm: int
     spread_ppm: int
     max_budget_sats: int
     max_budget_msat: int
@@ -98,6 +102,8 @@ class RebalanceCandidate:
     expected_profit_sats: int
     liquidity_ratio: float
     dest_flow_state: str
+    dest_turnover_rate: float
+    source_turnover_rate: float
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -109,13 +115,16 @@ class RebalanceCandidate:
             "amount_msat": self.amount_msat,
             "outbound_fee_ppm": self.outbound_fee_ppm,
             "inbound_fee_ppm": self.inbound_fee_ppm,
+            "source_fee_ppm": self.source_fee_ppm,
             "spread_ppm": self.spread_ppm,
             "max_budget_sats": self.max_budget_sats,
             "max_budget_msat": self.max_budget_msat,
             "max_fee_ppm": self.max_fee_ppm,
             "expected_profit_sats": self.expected_profit_sats,
             "liquidity_ratio": round(self.liquidity_ratio, 4),
-            "dest_flow_state": self.dest_flow_state
+            "dest_flow_state": self.dest_flow_state,
+            "dest_turnover_rate": round(self.dest_turnover_rate, 4),
+            "source_turnover_rate": round(self.source_turnover_rate, 4)
         }
 
 
@@ -348,15 +357,36 @@ class EVRebalancer:
         # This is the fee we'll pay to route sats to ourselves
         inbound_fee_ppm = self._estimate_inbound_fee(dest_info.get("peer_id", ""))
         
-        # Calculate spread
-        spread_ppm = outbound_fee_ppm - inbound_fee_ppm
+        # Find best source channel FIRST (we need source fee for opportunity cost)
+        best_source = self._select_source_channel(sources, rebalance_amount, dest_channel)
+        if not best_source:
+            return None
+        
+        source_id, source_info = best_source
+        
+        # NEW: Get source channel fee (OPPORTUNITY COST)
+        # By draining the source channel, we lose potential routing income
+        source_fee_ppm = source_info.get("fee_ppm", 0)
+        
+        # NEW: Calculate spread INCLUDING opportunity cost
+        # Old: spread = dest_fee - inbound_cost
+        # New: spread = dest_fee - inbound_cost - source_fee (opportunity cost)
+        #
+        # Logic: We're "selling" liquidity from Source to "buy" liquidity on Dest.
+        # If Source earns 500ppm and Dest earns 600ppm with 200ppm rebalance cost:
+        #   Old spread: 600 - 200 = 400ppm (looks profitable!)
+        #   New spread: 600 - 200 - 500 = -100ppm (actually a loss!)
+        #
+        # We should only rebalance if the destination channel earns MORE than
+        # the source channel PLUS the rebalancing cost.
+        spread_ppm = outbound_fee_ppm - inbound_fee_ppm - source_fee_ppm
         
         # CRITICAL: Check spread FIRST before any calculations
         # If spread is negative, we LOSE money on every rebalance!
         if spread_ppm <= 0:
             self.plugin.log(
-                f"Skipping {dest_channel}: negative/zero spread "
-                f"(outbound={outbound_fee_ppm}ppm, inbound={inbound_fee_ppm}ppm, spread={spread_ppm}ppm)"
+                f"Skipping {dest_channel}: negative/zero spread after opportunity cost "
+                f"(dest={outbound_fee_ppm}ppm - rebal={inbound_fee_ppm}ppm - source={source_fee_ppm}ppm = {spread_ppm}ppm)"
             )
             return None
         
@@ -367,9 +397,13 @@ class EVRebalancer:
         
         # Calculate max fee as PPM for circular
         # This is the KEY constraint we pass to circular
-        # (max_fee_msat / amount_msat) * 1_000_000
+        # Note: We use inbound_fee_ppm here since that's what we're actually paying
+        # The spread already accounts for opportunity cost in expected profit
         if amount_msat > 0:
-            max_fee_ppm = int((max_budget_msat / amount_msat) * 1_000_000)
+            # Effective max fee = spread + inbound (since we want to pay at most what
+            # makes us break even after opportunity cost)
+            effective_max_fee_ppm = inbound_fee_ppm + (spread_ppm // 2)  # Leave margin
+            max_fee_ppm = max(1, min(effective_max_fee_ppm, spread_ppm + inbound_fee_ppm))
         else:
             max_fee_ppm = 0
         
@@ -380,37 +414,48 @@ class EVRebalancer:
             )
             return None
         
-        # Calculate expected profit (conservative estimate)
-        # Assume we'll route ~10% of the amount we rebalance before needing to rebalance again
-        utilization_estimate = 0.10
-        expected_routing = rebalance_amount * utilization_estimate
+        # NEW: Dynamic utilization based on actual channel turnover
+        # OLD: utilization_estimate = 0.10 (hardcoded 10% - unrealistic)
+        # NEW: Use actual turnover rate from channel history
+        dest_turnover_rate = self._calculate_turnover_rate(dest_channel, capacity)
+        source_capacity = source_info.get("capacity", 1)
+        source_turnover_rate = self._calculate_turnover_rate(source_id, source_capacity)
+        
+        # Project expected routing based on actual turnover, scaled by cooldown period
+        # If channel turns over 5% daily and cooldown is 24h, expect ~5% utilization
+        cooldown_days = self.config.rebalance_cooldown_hours / 24.0
+        expected_utilization = min(dest_turnover_rate * cooldown_days, 1.0)  # Cap at 100%
+        
+        # Ensure minimum utilization estimate if no history
+        expected_utilization = max(expected_utilization, 0.05)  # At least 5%
+        
+        expected_routing = rebalance_amount * expected_utilization
         expected_fee_income = (expected_routing * outbound_fee_ppm) // 1_000_000
         
-        # Estimated profit = expected income - max budget (worst case fee)
-        expected_profit = expected_fee_income - max_budget_sats
+        # Calculate opportunity cost: what we'd lose by draining source
+        expected_source_loss = (expected_routing * source_fee_ppm) // 1_000_000
+        
+        # Estimated profit = expected income - max budget - opportunity cost
+        expected_profit = expected_fee_income - max_budget_sats - expected_source_loss
         
         # CRITICAL: Check if expected profit meets minimum threshold
         # This is the EV check - only rebalance if we expect to profit
         if expected_profit < self.config.rebalance_min_profit:
             self.plugin.log(
-                f"Skipping {dest_channel}: not profitable enough "
-                f"(expected_profit={expected_profit}sats < min={self.config.rebalance_min_profit}sats, "
-                f"fee_income={expected_fee_income}sats, max_cost={max_budget_sats}sats)"
+                f"Skipping {dest_channel}: not profitable enough with opportunity cost "
+                f"(profit={expected_profit}sats < min={self.config.rebalance_min_profit}sats, "
+                f"fee_income={expected_fee_income}sats, rebal_cost={max_budget_sats}sats, "
+                f"opp_cost={expected_source_loss}sats, turnover={dest_turnover_rate:.2%})"
             )
             return None
-        
-        # Find best source channel
-        best_source = self._select_source_channel(sources, rebalance_amount)
-        if not best_source:
-            return None
-        
-        source_id, source_info = best_source
         
         # Log priority for SOURCE channels
         if dest_flow_state == "source":
             self.plugin.log(
                 f"HIGH PRIORITY: {dest_channel} is a SOURCE (money printer). "
-                f"Spread={spread_ppm}ppm, MaxFee={max_fee_ppm}ppm"
+                f"NetSpread={spread_ppm}ppm (dest={outbound_fee_ppm}ppm, "
+                f"rebal={inbound_fee_ppm}ppm, opp_cost={source_fee_ppm}ppm), "
+                f"turnover={dest_turnover_rate:.2%}"
             )
         
         return RebalanceCandidate(
@@ -422,14 +467,59 @@ class EVRebalancer:
             amount_msat=amount_msat,
             outbound_fee_ppm=outbound_fee_ppm,
             inbound_fee_ppm=inbound_fee_ppm,
+            source_fee_ppm=source_fee_ppm,
             spread_ppm=spread_ppm,
             max_budget_sats=max_budget_sats,
             max_budget_msat=max_budget_msat,
             max_fee_ppm=max_fee_ppm,
             expected_profit_sats=expected_profit,
             liquidity_ratio=dest_ratio,
-            dest_flow_state=dest_flow_state
+            dest_flow_state=dest_flow_state,
+            dest_turnover_rate=dest_turnover_rate,
+            source_turnover_rate=source_turnover_rate
         )
+    
+    def _calculate_turnover_rate(self, channel_id: str, capacity: int) -> float:
+        """
+        Calculate the daily turnover rate for a channel.
+        
+        Turnover Rate = Daily Volume / Capacity
+        
+        This tells us how much of the channel's capacity is utilized per day.
+        A channel with 1M capacity and 100k daily volume has 10% turnover.
+        
+        Args:
+            channel_id: Channel to calculate turnover for
+            capacity: Channel capacity in sats
+            
+        Returns:
+            Turnover rate as decimal (e.g., 0.10 = 10% daily turnover)
+        """
+        if capacity <= 0:
+            return 0.0
+        
+        try:
+            # Get daily volume from channel state
+            state = self.database.get_channel_state(channel_id)
+            if not state:
+                return 0.05  # Default 5% if no data
+            
+            # Calculate daily volume (sats_in + sats_out over flow_window_days)
+            total_volume = state.get("sats_in", 0) + state.get("sats_out", 0)
+            flow_window = max(self.config.flow_window_days, 1)
+            daily_volume = total_volume / flow_window
+            
+            # Calculate turnover rate
+            turnover_rate = daily_volume / capacity
+            
+            # Sanity bounds (0.01% to 100% daily turnover)
+            turnover_rate = max(0.0001, min(1.0, turnover_rate))
+            
+            return turnover_rate
+            
+        except Exception as e:
+            self.plugin.log(f"Error calculating turnover for {channel_id}: {e}", level='debug')
+            return 0.05  # Default 5% on error
     
     def _estimate_inbound_fee(self, peer_id: str, amount_msat: int = 100000000) -> int:
         """
@@ -619,25 +709,31 @@ class EVRebalancer:
         return None
     
     def _select_source_channel(self, sources: List[Tuple[str, Dict[str, Any], float]],
-                               amount_needed: int) -> Optional[Tuple[str, Dict[str, Any]]]:
+                               amount_needed: int,
+                               dest_channel: Optional[str] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
         """
         Select the best source channel for rebalancing.
         
+        NEW: Now considers opportunity cost when scoring sources.
+        Lower fee sources are preferred because draining them costs us less
+        in opportunity cost.
+        
         Criteria:
         1. Has enough excess liquidity
-        2. Ideally a channel that's filling (sink state)
-        3. Low fees (so we're not wasting good outbound)
+        2. Ideally a channel that's filling (sink state) - no opportunity cost!
+        3. LOWEST fees preferred (minimize opportunity cost)
         4. Peer is connected and reliable
         
         Args:
             sources: List of source channel candidates
             amount_needed: How much we need to move
+            dest_channel: Optional destination channel (for logging)
             
         Returns:
             (channel_id, channel_info) tuple or None
         """
         best_source = None
-        best_score = -1
+        best_score = -float('inf')
         
         # Get peer connection status for reliability scoring
         peer_status = self._get_peer_connection_status()
@@ -660,18 +756,27 @@ class EVRebalancer:
                     continue
             
             # Calculate score (higher = better source)
-            # Prefer channels with:
-            # - Higher outbound ratio (more excess)
-            # - Lower fees (not wasting valuable outbound)
+            # CHANGED: Now HEAVILY penalize high-fee sources (opportunity cost)
             fee_ppm = info.get("fee_ppm", 1000)
             
-            # Score: ratio bonus - fee penalty
-            score = (outbound_ratio * 100) - (fee_ppm / 100)
+            # NEW scoring formula emphasizing LOW opportunity cost:
+            # - Ratio bonus: channels with more excess (up to 50 points)
+            # - Fee PENALTY: high-fee channels are expensive to drain
+            #   (fee_ppm / 10 means 1000ppm = -100 points penalty)
+            score = (outbound_ratio * 50) - (fee_ppm / 10)
             
-            # Bonus if channel is sink (filling up)
+            # BIG Bonus if channel is sink (filling up)
+            # Sinks have essentially ZERO opportunity cost - they refill for free!
             state = self.database.get_channel_state(channel_id)
             if state and state.get("state") == "sink":
-                score += 20
+                score += 100  # Major bonus - sinks are ideal sources
+                self.plugin.log(
+                    f"Source {channel_id} is SINK (ideal - zero opp cost), fee={fee_ppm}ppm",
+                    level='debug'
+                )
+            elif state and state.get("state") == "balanced":
+                score += 20  # Moderate bonus for balanced channels
+            # SOURCE channels get no bonus - they're earning money, don't drain them!
             
             # Bonus for reliable peers (connected with features)
             if peer_id and peer_id in peer_status:
@@ -992,14 +1097,19 @@ class EVRebalancer:
         # Calculate EV even for manual
         outbound_fee_ppm = to_info.get("fee_ppm", 0)
         inbound_fee_ppm = self._estimate_inbound_fee(to_info.get("peer_id", ""))
-        spread_ppm = outbound_fee_ppm - inbound_fee_ppm
+        
+        # Get source channel fee (opportunity cost)
+        source_fee_ppm = from_info.get("fee_ppm", 0)
+        
+        # Calculate spread including opportunity cost
+        spread_ppm = outbound_fee_ppm - inbound_fee_ppm - source_fee_ppm
         
         # Convert to msat
         amount_msat = amount_sats * 1000
         
         # Calculate max budget if not provided
         if max_fee_sats is None:
-            max_fee_sats = (spread_ppm * amount_sats) // 1_000_000
+            max_fee_sats = max(0, (spread_ppm * amount_sats) // 1_000_000)
         
         max_budget_msat = max_fee_sats * 1000
         
@@ -1008,6 +1118,19 @@ class EVRebalancer:
             max_fee_ppm = int((max_budget_msat / amount_msat) * 1_000_000)
         else:
             max_fee_ppm = 0
+        
+        # Calculate turnover rates for tracking
+        dest_capacity = to_info.get("capacity", 1)
+        source_capacity = from_info.get("capacity", 1)
+        dest_turnover_rate = self._calculate_turnover_rate(to_channel, dest_capacity)
+        source_turnover_rate = self._calculate_turnover_rate(from_channel, source_capacity)
+        
+        # Calculate expected profit including opportunity cost
+        expected_utilization = max(dest_turnover_rate * (self.config.rebalance_cooldown_hours / 24.0), 0.05)
+        expected_routing = amount_sats * expected_utilization
+        expected_fee_income = (expected_routing * outbound_fee_ppm) // 1_000_000
+        expected_source_loss = (expected_routing * source_fee_ppm) // 1_000_000
+        expected_profit = expected_fee_income - max_fee_sats - expected_source_loss
         
         # Build candidate
         candidate = RebalanceCandidate(
@@ -1019,19 +1142,23 @@ class EVRebalancer:
             amount_msat=amount_msat,
             outbound_fee_ppm=outbound_fee_ppm,
             inbound_fee_ppm=inbound_fee_ppm,
+            source_fee_ppm=source_fee_ppm,
             spread_ppm=spread_ppm,
             max_budget_sats=max_fee_sats,
             max_budget_msat=max_budget_msat,
             max_fee_ppm=max_fee_ppm,
-            expected_profit_sats=max_fee_sats - (inbound_fee_ppm * amount_sats // 1_000_000),
+            expected_profit_sats=expected_profit,
             liquidity_ratio=to_info.get("spendable_sats", 0) / max(to_info.get("capacity", 1), 1),
-            dest_flow_state=dest_flow_state
+            dest_flow_state=dest_flow_state,
+            dest_turnover_rate=dest_turnover_rate,
+            source_turnover_rate=source_turnover_rate
         )
         
-        # Warn if negative EV
+        # Warn if negative EV (including opportunity cost)
         if spread_ppm <= 0:
             self.plugin.log(
-                f"Warning: Manual rebalance has negative EV (spread={spread_ppm} PPM)",
+                f"Warning: Manual rebalance has negative EV after opportunity cost "
+                f"(dest={outbound_fee_ppm}ppm - rebal={inbound_fee_ppm}ppm - source={source_fee_ppm}ppm = {spread_ppm}ppm)",
                 level='warn'
             )
         

@@ -1,29 +1,36 @@
 """
-PID Fee Controller module for cl-revenue-ops
+Hill Climbing Fee Controller module for cl-revenue-ops
 
-MODULE 2: PID Fee Controller (Dynamic Pricing)
+MODULE 2: Revenue-Maximizing Fee Controller (Dynamic Pricing)
 
-This module implements a PID (Proportional-Integral-Derivative) controller
-for dynamically adjusting channel fees based on routing flow.
+This module implements a Hill Climbing (Perturb & Observe) algorithm
+for dynamically adjusting channel fees to maximize revenue.
 
-PID Control Theory Applied to Fees:
-- Target: A desired flow rate (e.g., 100,000 sats/day routed)
-- Error: Difference between actual and target flow
-- P (Proportional): React to current error
-- I (Integral): Account for accumulated error over time
-- D (Derivative): React to rate of change of error
+Why Hill Climbing Instead of PID?
+- PID targets a static flow rate, ignoring price elasticity
+- Hill Climbing actively seeks the revenue-maximizing fee point
+- It adapts to changing market conditions and peer behavior
 
-Fee Adjustment Logic:
-- If ActualFlow > Target: Increase fees (capture margin, slow drain)
-- If ActualFlow < Target: Decrease fees (encourage volume)
+Hill Climbing Algorithm:
+1. Perturb: Make a small fee change in a direction
+2. Observe: Measure the resulting revenue change
+3. Decide:
+   - If Revenue Increased: Keep going in the same direction
+   - If Revenue Decreased: Reverse direction (we went too far)
+4. Repeat: Continuously seek the optimal fee point
+
+Revenue Calculation:
+- Revenue = Volume * Fee
+- We track revenue over time windows to measure impact of changes
 
 Constraints:
 - Never drop below floor (economic minimum based on chain costs)
 - Never exceed ceiling (prevent absurd fees)
+- Use liquidity bucket multipliers as secondary weighting
 - Unmanage from clboss before setting fees
 
-The PID controller provides smooth, stable fee adjustments that avoid
-the oscillation problems of simple threshold-based approaches.
+The Hill Climber provides adaptive, revenue-seeking fee adjustments that
+find the optimal price point where volume * fee is maximized.
 """
 
 import time
@@ -41,20 +48,22 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class PIDState:
+class HillClimbState:
     """
-    State of a PID controller for one channel.
+    State of the Hill Climbing fee optimizer for one channel.
     
     Attributes:
-        integral: Accumulated error over time
-        last_error: Error from previous iteration (for derivative)
-        last_fee_ppm: Last fee we set
+        last_revenue_sats: Revenue observed in the previous period
+        last_fee_ppm: Fee that was in effect during last period
+        trend_direction: Current search direction (1 = increasing, -1 = decreasing)
         last_update: Timestamp of last update
+        consecutive_same_direction: How many times we've moved in same direction
     """
-    integral: float = 0.0
-    last_error: float = 0.0
+    last_revenue_sats: int = 0
     last_fee_ppm: int = 0
+    trend_direction: int = 1  # 1 = try increasing fee, -1 = try decreasing
     last_update: int = 0
+    consecutive_same_direction: int = 0
 
 
 @dataclass
@@ -68,14 +77,14 @@ class FeeAdjustment:
         old_fee_ppm: Previous fee
         new_fee_ppm: New fee after adjustment
         reason: Explanation of the adjustment
-        pid_values: PID controller internal values
+        hill_climb_values: Hill Climbing algorithm internal values
     """
     channel_id: str
     peer_id: str
     old_fee_ppm: int
     new_fee_ppm: int
     reason: str
-    pid_values: Dict[str, float]
+    hill_climb_values: Dict[str, Any]
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -84,24 +93,36 @@ class FeeAdjustment:
             "old_fee_ppm": self.old_fee_ppm,
             "new_fee_ppm": self.new_fee_ppm,
             "reason": self.reason,
-            "pid_values": self.pid_values
+            "hill_climb_values": self.hill_climb_values
         }
 
 
-class PIDFeeController:
+class HillClimbingFeeController:
     """
-    PID-based fee controller for dynamic channel pricing.
+    Hill Climbing (Perturb & Observe) fee controller for revenue maximization.
     
-    The controller aims to maintain a target flow rate by adjusting fees.
-    It uses a PID algorithm for smooth, stable adjustments.
+    The controller aims to find the revenue-maximizing fee by iteratively
+    adjusting fees and observing the revenue impact.
     
-    Key Features:
-    1. Flow-based targeting: Adjusts fees based on actual routing volume
-    2. Liquidity-aware: Considers channel balance when setting fees
-    3. Economic floor: Never charges less than channel costs
-    4. clboss override: Unmanages from clboss before setting fees
-    5. Profitability-aware: Adjusts fees based on channel ROI
+    Key Principles:
+    1. Revenue Focus: Maximize Volume * Fee, not just volume
+    2. Adaptive: Learns from revenue changes to find optimal fees
+    3. Bounded: Respects floor/ceiling constraints
+    4. Liquidity-aware: Uses bucket multipliers as weights
+    5. clboss override: Unmanages from clboss before setting fees
+    
+    Hill Climbing Parameters:
+    - step_ppm: Base fee change per iteration (default 50 ppm)
+    - step_percent: Alternative step as percentage (default 5%)
+    - min_observation_window: Minimum time between changes (default 6 hours)
     """
+    
+    # Hill Climbing parameters
+    STEP_PPM = 50           # Fixed step size in PPM
+    STEP_PERCENT = 0.05     # Percentage step size (5%)
+    MIN_STEP_PPM = 10       # Minimum step size
+    MAX_STEP_PPM = 200      # Maximum step size
+    MAX_CONSECUTIVE = 5     # Max consecutive moves in same direction before reducing step
     
     def __init__(self, plugin: Plugin, config: Config, database: Database, 
                  clboss_manager: ClbossManager,
@@ -122,12 +143,12 @@ class PIDFeeController:
         self.clboss = clboss_manager
         self.profitability = profitability_analyzer
         
-        # In-memory cache of PID states (also persisted to DB)
-        self._pid_states: Dict[str, PIDState] = {}
+        # In-memory cache of Hill Climbing states (also persisted to DB)
+        self._hill_climb_states: Dict[str, HillClimbState] = {}
     
     def adjust_all_fees(self) -> List[FeeAdjustment]:
         """
-        Adjust fees for all channels based on PID control.
+        Adjust fees for all channels using Hill Climbing optimization.
         
         This is the main entry point, called periodically by the timer.
         
@@ -178,15 +199,14 @@ class PIDFeeController:
                            state: Dict[str, Any], 
                            channel_info: Dict[str, Any]) -> Optional[FeeAdjustment]:
         """
-        Adjust fee for a single channel using PID control.
+        Adjust fee for a single channel using Hill Climbing optimization.
         
-        PID Formula:
-        output = Kp * error + Ki * integral + Kd * derivative
-        
-        Where:
-        - error = target_flow - actual_flow
-        - integral = sum of errors over time
-        - derivative = change in error since last iteration
+        Hill Climbing (Perturb & Observe) Algorithm:
+        1. Calculate current revenue (volume * fee)
+        2. Compare to last period's revenue
+        3. If revenue increased: continue in same direction
+        4. If revenue decreased: reverse direction
+        5. Apply step change in calculated direction
         
         Args:
             channel_id: Channel to adjust
@@ -199,59 +219,22 @@ class PIDFeeController:
         """
         # Get current fee
         current_fee_ppm = channel_info.get("fee_proportional_millionths", 0)
+        if current_fee_ppm == 0:
+            current_fee_ppm = self.config.min_fee_ppm  # Initialize if not set
         
-        # Load PID state
-        pid_state = self._get_pid_state(channel_id)
+        # Load Hill Climbing state
+        hc_state = self._get_hill_climb_state(channel_id)
         
-        # Calculate error
-        # Error = Target - Actual (positive = below target, need lower fees)
+        now = int(time.time())
+        
+        # Calculate current revenue for this observation window
+        # Revenue = Volume * Fee_PPM / 1_000_000
         daily_volume = state.get("sats_in", 0) + state.get("sats_out", 0)
         daily_volume = daily_volume // max(self.config.flow_window_days, 1)
         
-        target_flow = self.config.target_flow
-        error = target_flow - daily_volume
+        current_revenue_sats = (daily_volume * current_fee_ppm) // 1_000_000
         
-        # Time since last update (for integral and derivative)
-        now = int(time.time())
-        dt = max(1, now - pid_state.last_update) if pid_state.last_update > 0 else self.config.fee_interval
-        dt_hours = dt / 3600.0  # Convert to hours for stable scaling
-        
-        # Calculate PID components
-        # P: Proportional to current error
-        p_term = self.config.pid_kp * error
-        
-        # I: Integral of error over time
-        pid_state.integral += error * dt_hours
-        # Clamp integral to prevent windup
-        pid_state.integral = max(-self.config.pid_integral_max, 
-                                 min(self.config.pid_integral_max, pid_state.integral))
-        i_term = self.config.pid_ki * pid_state.integral
-        
-        # D: Derivative (rate of change of error)
-        # CRITICAL: Skip derivative on first run to prevent spike
-        # When last_update == 0, we have no valid previous error to compare
-        if pid_state.last_update == 0:
-            derivative = 0.0
-        else:
-            derivative = (error - pid_state.last_error) / max(dt_hours, 0.1)
-        d_term = self.config.pid_kd * derivative
-        
-        # Combined PID output (in fee adjustment direction)
-        # Negative output = increase fees (below target flow)
-        # Positive output = decrease fees (above target flow)
-        pid_output = p_term + i_term + d_term
-        
-        # Clamp output
-        pid_output = max(-self.config.pid_output_max, 
-                        min(self.config.pid_output_max, pid_output))
-        
-        # Convert PID output to fee adjustment
-        # Scale: output in "flow sats" -> fee PPM adjustment
-        # Higher flow deficit -> decrease fee more
-        # Flow surplus -> increase fee
-        fee_adjustment = -pid_output / 1000  # Scale factor
-        
-        # Apply liquidity-based multiplier
+        # Get capacity and balance for liquidity adjustments
         capacity = channel_info.get("capacity", 1)
         spendable = channel_info.get("spendable_msat", 0) // 1000
         outbound_ratio = spendable / capacity if capacity > 0 else 0.5
@@ -259,78 +242,119 @@ class PIDFeeController:
         bucket = LiquidityBuckets.get_bucket(outbound_ratio)
         liquidity_multiplier = LiquidityBuckets.get_fee_multiplier(bucket)
         
-        # Apply flow state bias
-        # SOURCE channels are money printers (draining) - charge higher fees (scarce)
-        # SINK channels fill for free - lower fees to encourage outflow
+        # Get flow state for bias
         flow_state = state.get("state", "balanced")
         flow_state_multiplier = 1.0
         if flow_state == "source":
-            flow_state_multiplier = 1.25  # 25% higher fees for sources
+            flow_state_multiplier = 1.25  # Sources are scarce - higher fees
         elif flow_state == "sink":
-            flow_state_multiplier = 0.80  # 20% lower fees for sinks
+            flow_state_multiplier = 0.80  # Sinks fill for free - lower floor
         
-        # Apply profitability multiplier
-        # Profitable channels can afford competitive fees, underwater channels need recovery
+        # Get profitability multiplier (uses marginal ROI now)
         profitability_multiplier = 1.0
-        profitability_class = "unknown"
+        marginal_roi_info = "unknown"
         if self.profitability:
             profitability_multiplier = self.profitability.get_fee_multiplier(channel_id)
             prof_data = self.profitability.get_profitability(channel_id)
             if prof_data:
-                profitability_class = prof_data.classification.value
+                marginal_roi_info = f"marginal_roi={prof_data.marginal_roi_percent:.1f}%"
         
-        # Calculate new fee
-        base_fee = current_fee_ppm + fee_adjustment
-        new_fee_ppm = int(base_fee * liquidity_multiplier * flow_state_multiplier * profitability_multiplier)
-        
-        # Apply floor and ceiling
+        # Calculate floor and ceiling
         floor_ppm = self._calculate_floor(capacity)
         floor_ppm = max(floor_ppm, self.config.min_fee_ppm)
+        # Apply flow state to floor (sinks can go lower)
+        floor_ppm = int(floor_ppm * flow_state_multiplier)
+        floor_ppm = max(floor_ppm, 1)  # Never go below 1 ppm
+        
         ceiling_ppm = self.config.max_fee_ppm
         
+        # HILL CLIMBING DECISION
+        # Compare current revenue to last observed revenue
+        revenue_change = current_revenue_sats - hc_state.last_revenue_sats
+        last_direction = hc_state.trend_direction
+        previous_revenue = hc_state.last_revenue_sats  # Save for logging before update
+        
+        # Determine new direction based on revenue change
+        if hc_state.last_update == 0:
+            # First run - start by trying to increase (default direction)
+            new_direction = 1
+            decision_reason = "initial"
+        elif revenue_change > 0:
+            # Revenue increased! Keep going in same direction
+            new_direction = last_direction
+            decision_reason = f"revenue_up_{revenue_change}sats_continue"
+            hc_state.consecutive_same_direction += 1
+        elif revenue_change < 0:
+            # Revenue decreased! Reverse direction
+            new_direction = -last_direction
+            decision_reason = f"revenue_down_{abs(revenue_change)}sats_reverse"
+            hc_state.consecutive_same_direction = 0
+        else:
+            # Revenue unchanged - try opposite direction (we may be at optimum)
+            new_direction = -last_direction
+            decision_reason = "revenue_flat_try_opposite"
+            hc_state.consecutive_same_direction = 0
+        
+        # Calculate step size
+        # Use percentage OR fixed PPM, whichever is larger
+        step_percent = max(current_fee_ppm * self.STEP_PERCENT, self.MIN_STEP_PPM)
+        step_ppm = min(max(self.STEP_PPM, step_percent), self.MAX_STEP_PPM)
+        
+        # Reduce step if we've been moving in same direction too long
+        # (we might be oscillating around the optimum)
+        if hc_state.consecutive_same_direction > self.MAX_CONSECUTIVE:
+            step_ppm = step_ppm // 2
+            step_ppm = max(step_ppm, self.MIN_STEP_PPM)
+        
+        # Calculate base new fee
+        base_new_fee = current_fee_ppm + (new_direction * step_ppm)
+        
+        # Apply multipliers (secondary weighting)
+        new_fee_ppm = int(base_new_fee * liquidity_multiplier * profitability_multiplier)
+        
+        # Enforce floor and ceiling
         new_fee_ppm = max(floor_ppm, min(ceiling_ppm, new_fee_ppm))
         
-        # Check if fee changed significantly (at least 5% or 5 PPM)
+        # Check if fee changed meaningfully
         fee_change = abs(new_fee_ppm - current_fee_ppm)
-        min_change = max(5, current_fee_ppm * 0.05)
+        min_change = max(5, current_fee_ppm * 0.03)  # 3% or 5 ppm minimum
+        
+        # Always update state for tracking
+        hc_state.last_revenue_sats = current_revenue_sats
+        hc_state.last_fee_ppm = current_fee_ppm
+        hc_state.trend_direction = new_direction
+        hc_state.last_update = now
+        self._save_hill_climb_state(channel_id, hc_state)
         
         if fee_change < min_change:
             # Not enough change to warrant update
-            # Still update PID state for next iteration
-            pid_state.last_error = error
-            pid_state.last_update = now
-            self._save_pid_state(channel_id, pid_state)
             return None
         
         # Build reason string
-        reason = (f"PID adjustment: flow={daily_volume}/day (target={target_flow}), "
-                 f"state={flow_state} (x{flow_state_multiplier}), "
+        reason = (f"HillClimb: revenue={current_revenue_sats}sats ({decision_reason}), "
+                 f"direction={'up' if new_direction > 0 else 'down'}, "
+                 f"step={step_ppm}ppm, state={flow_state}, "
                  f"liquidity={bucket} ({outbound_ratio:.0%}), "
-                 f"profit={profitability_class} (x{profitability_multiplier})")
+                 f"{marginal_roi_info}")
         
         # Apply the fee change
         result = self.set_channel_fee(channel_id, new_fee_ppm, reason=reason)
         
         if result.get("success"):
-            # Update PID state
-            pid_state.last_error = error
-            pid_state.last_fee_ppm = new_fee_ppm
-            pid_state.last_update = now
-            self._save_pid_state(channel_id, pid_state)
-            
             return FeeAdjustment(
                 channel_id=channel_id,
                 peer_id=peer_id,
                 old_fee_ppm=current_fee_ppm,
                 new_fee_ppm=new_fee_ppm,
                 reason=reason,
-                pid_values={
-                    "error": error,
-                    "p_term": p_term,
-                    "i_term": i_term,
-                    "d_term": d_term,
-                    "output": pid_output,
-                    "integral": pid_state.integral
+                hill_climb_values={
+                    "current_revenue_sats": current_revenue_sats,
+                    "previous_revenue_sats": previous_revenue,
+                    "revenue_change": revenue_change,
+                    "direction": new_direction,
+                    "step_ppm": step_ppm,
+                    "consecutive_same_direction": hc_state.consecutive_same_direction,
+                    "daily_volume": daily_volume
                 }
             )
         
@@ -520,36 +544,38 @@ class PIDFeeController:
             self.plugin.log(f"Error getting feerates: {e}", level='debug')
             return None
     
-    def _get_pid_state(self, channel_id: str) -> PIDState:
+    def _get_hill_climb_state(self, channel_id: str) -> HillClimbState:
         """
-        Get PID controller state for a channel.
+        Get Hill Climbing state for a channel.
         
         Checks in-memory cache first, then database.
         """
-        if channel_id in self._pid_states:
-            return self._pid_states[channel_id]
+        if channel_id in self._hill_climb_states:
+            return self._hill_climb_states[channel_id]
         
-        # Load from database
-        db_state = self.database.get_pid_state(channel_id)
+        # Load from database (uses the fee_strategy_state table)
+        db_state = self.database.get_fee_strategy_state(channel_id)
         
-        pid_state = PIDState(
-            integral=db_state.get("integral", 0.0),
-            last_error=db_state.get("last_error", 0.0),
+        hc_state = HillClimbState(
+            last_revenue_sats=db_state.get("last_revenue_sats", 0),
             last_fee_ppm=db_state.get("last_fee_ppm", 0),
-            last_update=db_state.get("last_update", 0)
+            trend_direction=db_state.get("trend_direction", 1),
+            last_update=db_state.get("last_update", 0),
+            consecutive_same_direction=db_state.get("consecutive_same_direction", 0)
         )
         
-        self._pid_states[channel_id] = pid_state
-        return pid_state
+        self._hill_climb_states[channel_id] = hc_state
+        return hc_state
     
-    def _save_pid_state(self, channel_id: str, state: PIDState):
-        """Save PID state to cache and database."""
-        self._pid_states[channel_id] = state
-        self.database.update_pid_state(
+    def _save_hill_climb_state(self, channel_id: str, state: HillClimbState):
+        """Save Hill Climbing state to cache and database."""
+        self._hill_climb_states[channel_id] = state
+        self.database.update_fee_strategy_state(
             channel_id=channel_id,
-            integral=state.integral,
-            last_error=state.last_error,
-            last_fee_ppm=state.last_fee_ppm
+            last_revenue_sats=state.last_revenue_sats,
+            last_fee_ppm=state.last_fee_ppm,
+            trend_direction=state.trend_direction,
+            consecutive_same_direction=state.consecutive_same_direction
         )
     
     def _get_channels_info(self) -> Dict[str, Dict[str, Any]]:
@@ -602,13 +628,17 @@ class PIDFeeController:
         
         return channels
     
-    def reset_pid_state(self, channel_id: str):
+    def reset_hill_climb_state(self, channel_id: str):
         """
-        Reset PID state for a channel.
+        Reset Hill Climbing state for a channel.
         
         Use this when manually intervening or if the controller
         is behaving erratically.
         """
-        pid_state = PIDState()
-        self._save_pid_state(channel_id, pid_state)
-        self.plugin.log(f"Reset PID state for {channel_id}")
+        hc_state = HillClimbState()
+        self._save_hill_climb_state(channel_id, hc_state)
+        self.plugin.log(f"Reset Hill Climbing state for {channel_id}")
+
+
+# Keep alias for backward compatibility
+PIDFeeController = HillClimbingFeeController

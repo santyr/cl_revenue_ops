@@ -87,6 +87,7 @@ class Database:
         """)
         
         # PID state table - stores controller state per channel
+        # LEGACY: Kept for backward compatibility, but Hill Climbing uses fee_strategy_state
         conn.execute("""
             CREATE TABLE IF NOT EXISTS pid_state (
                 channel_id TEXT PRIMARY KEY,
@@ -94,6 +95,19 @@ class Database:
                 last_error REAL NOT NULL DEFAULT 0,
                 last_fee_ppm INTEGER NOT NULL DEFAULT 0,
                 last_update INTEGER NOT NULL
+            )
+        """)
+        
+        # NEW: Fee Strategy State table for Hill Climbing controller
+        # Stores state for the revenue-maximizing Perturb & Observe algorithm
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fee_strategy_state (
+                channel_id TEXT PRIMARY KEY,
+                last_revenue_sats INTEGER NOT NULL DEFAULT 0,
+                last_fee_ppm INTEGER NOT NULL DEFAULT 0,
+                trend_direction INTEGER NOT NULL DEFAULT 1,  -- 1 = increase, -1 = decrease
+                consecutive_same_direction INTEGER NOT NULL DEFAULT 0,
+                last_update INTEGER NOT NULL DEFAULT 0
             )
         """)
         
@@ -235,11 +249,11 @@ class Database:
         return [dict(row) for row in rows]
     
     # =========================================================================
-    # PID State Methods
+    # PID State Methods (LEGACY - kept for backward compatibility)
     # =========================================================================
     
     def get_pid_state(self, channel_id: str) -> Dict[str, Any]:
-        """Get PID controller state for a channel."""
+        """Get PID controller state for a channel (LEGACY)."""
         conn = self._get_connection()
         row = conn.execute(
             "SELECT * FROM pid_state WHERE channel_id = ?",
@@ -260,7 +274,7 @@ class Database:
     
     def update_pid_state(self, channel_id: str, integral: float, last_error: float, 
                          last_fee_ppm: int):
-        """Update PID controller state for a channel."""
+        """Update PID controller state for a channel (LEGACY)."""
         conn = self._get_connection()
         now = int(time.time())
         
@@ -269,6 +283,87 @@ class Database:
             (channel_id, integral, last_error, last_fee_ppm, last_update)
             VALUES (?, ?, ?, ?, ?)
         """, (channel_id, integral, last_error, last_fee_ppm, now))
+    
+    # =========================================================================
+    # Fee Strategy State Methods (NEW - Hill Climbing Controller)
+    # =========================================================================
+    
+    def get_fee_strategy_state(self, channel_id: str) -> Dict[str, Any]:
+        """
+        Get Hill Climbing fee strategy state for a channel.
+        
+        Used by the revenue-maximizing Perturb & Observe algorithm.
+        
+        Args:
+            channel_id: Channel to get state for
+            
+        Returns:
+            Dict with last_revenue_sats, last_fee_ppm, trend_direction, etc.
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM fee_strategy_state WHERE channel_id = ?",
+            (channel_id,)
+        ).fetchone()
+        
+        if row:
+            return dict(row)
+        
+        # Return default state if not found
+        return {
+            'channel_id': channel_id,
+            'last_revenue_sats': 0,
+            'last_fee_ppm': 0,
+            'trend_direction': 1,  # Default: try increasing fee
+            'consecutive_same_direction': 0,
+            'last_update': 0
+        }
+    
+    def update_fee_strategy_state(self, channel_id: str, last_revenue_sats: int,
+                                   last_fee_ppm: int, trend_direction: int,
+                                   consecutive_same_direction: int = 0):
+        """
+        Update Hill Climbing fee strategy state for a channel.
+        
+        Called after each fee adjustment iteration to record the state
+        for the next observation period.
+        
+        Args:
+            channel_id: Channel to update
+            last_revenue_sats: Revenue observed in this period
+            last_fee_ppm: Fee that was in effect
+            trend_direction: Direction we were moving (1 = up, -1 = down)
+            consecutive_same_direction: How many times we've moved same way
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        
+        conn.execute("""
+            INSERT OR REPLACE INTO fee_strategy_state 
+            (channel_id, last_revenue_sats, last_fee_ppm, trend_direction,
+             consecutive_same_direction, last_update)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (channel_id, last_revenue_sats, last_fee_ppm, trend_direction,
+              consecutive_same_direction, now))
+    
+    def get_all_fee_strategy_states(self) -> List[Dict[str, Any]]:
+        """Get fee strategy state for all channels."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM fee_strategy_state").fetchall()
+        return [dict(row) for row in rows]
+    
+    def reset_fee_strategy_state(self, channel_id: str):
+        """
+        Reset the fee strategy state for a channel.
+        
+        Use when manually intervening or if the controller is behaving erratically.
+        """
+        conn = self._get_connection()
+        conn.execute(
+            "DELETE FROM fee_strategy_state WHERE channel_id = ?",
+            (channel_id,)
+        )
+        self.plugin.log(f"Reset fee strategy state for {channel_id}")
     
     # =========================================================================
     # Fee Change Methods
