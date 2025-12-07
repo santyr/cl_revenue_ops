@@ -32,6 +32,9 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - **Persistent failure tracking**: Failure counts survive plugin restarts (prevents retry storms)
 - **Last Hop Cost estimation**: Uses `listchannels` to get peer's actual fee policy toward us
 - **Adaptive failure backoff**: Exponential cooldown for channels that keep failing
+- **Global Capital Controls**: Prevents over-spending with two safety checks:
+  - **Daily Budget**: Limits total rebalancing fees to a configurable amount per 24 hours
+  - **Wallet Reserve**: Aborts rebalancing if total spendable funds (on-chain + channel local balance) fall below minimum threshold
 - Sets strict budget caps to ensure profitability
 - Supports both circular and sling rebalancer plugins
 
@@ -137,6 +140,8 @@ All options can be set via `lightning-cli` at startup or in your config file:
 | `revenue-ops-flow-window-days` | `7` | Days to analyze for flow |
 | `revenue-ops-clboss-enabled` | `true` | Enable clboss integration |
 | `revenue-ops-rebalancer` | `circular` | Rebalancer plugin (circular/sling) |
+| `revenue-ops-daily-budget-sats` | `5000` | Max rebalancing fees per 24 hours (sats) |
+| `revenue-ops-min-wallet-reserve` | `1000000` | Min total funds to keep in reserve (sats) |
 | `revenue-ops-dry-run` | `false` | Log actions without executing |
 
 *Note: The Hill Climbing fee controller manages its own internal state (step size, direction) automatically. PID parameters are kept for legacy compatibility but are not actively used.*
