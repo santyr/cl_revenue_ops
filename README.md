@@ -1,6 +1,6 @@
 # cl-revenue-ops (experimental, in-progress)
 
-A Revenue Operations Plugin for Core Lightning that provides intelligent fee management and profit-aware rebalancing.
+A Revenue Operations Plugin for Core Lightning that provides intelligent fee management, profit-aware rebalancing, and enterprise-grade observability.
 
 ## Overview
 
@@ -19,6 +19,7 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - Actively seeks the optimal fee point where `Revenue = Volume × Fee` is maximized
 - Includes **wiggle dampening** to reduce step size on direction reversals
 - **Volatility reset**: Detects large revenue shifts (>50%) and resets step size for aggressive re-exploration
+- **Deadband Hysteresis**: Enters "sleep mode" during stable markets to reduce gossip noise
 - Applies profitability multipliers based on channel health
 - Never drops below economic floor (based on channel costs)
 
@@ -32,10 +33,10 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - **Persistent failure tracking**: Failure counts survive plugin restarts (prevents retry storms)
 - **Last Hop Cost estimation**: Uses `listchannels` to get peer's actual fee policy toward us
 - **Adaptive failure backoff**: Exponential cooldown for channels that keep failing
+- **HTLC Slot Awareness**: Prevents rebalancing into congested channels (>80% slot usage)
 - **Global Capital Controls**: Prevents over-spending with two safety checks:
   - **Daily Budget**: Limits total rebalancing fees to a configurable amount per 24 hours
-  - **Wallet Reserve**: Aborts rebalancing if total spendable funds (on-chain + channel local balance) fall below minimum threshold
-- Sets strict budget caps to ensure profitability
+  - **Wallet Reserve**: Aborts rebalancing if total spendable funds fall below minimum threshold
 - Supports both circular and sling rebalancer plugins
 
 ### Module 4: Channel Profitability Analyzer
@@ -44,6 +45,24 @@ This plugin acts as a "Revenue Operations" layer that sits on top of the clboss 
 - Calculates **marginal ROI** to evaluate incremental investment value
 - Classifies channels as **PROFITABLE**, **BREAK_EVEN**, **UNDERWATER**, or **ZOMBIE**
 - Integrates with fee controller and rebalancer for smarter decisions
+
+### Module 5: Prometheus Metrics Exporter (Observability)
+- Exposes metrics via HTTP endpoint for Grafana/Prometheus integration
+- Thread-safe implementation using standard library only
+- Metrics exported:
+  - `cl_revenue_channel_fee_ppm` - Current fee rate per channel
+  - `cl_revenue_channel_revenue_rate_sats_hr` - Revenue rate in sats/hour
+  - `cl_revenue_channel_is_sleeping` - Deadband hysteresis sleep state (1=sleeping, 0=awake)
+  - `cl_revenue_channel_marginal_roi_percent` - Marginal ROI percentage
+  - `cl_revenue_rebalance_cost_total_sats` - Total rebalancing costs
+  - `cl_revenue_peer_reputation_score` - Peer success rate (0.0-1.0)
+  - `cl_revenue_system_last_run_timestamp_seconds` - Health monitoring
+
+### Module 6: Traffic Intelligence
+- **Peer Reputation Tracking**: Tracks HTLC success/failure rates per peer
+- **Reputation-Weighted Fees**: Discounts volume from high-failure peers in fee optimization
+- **HTLC Slot Monitoring**: Marks channels with >80% slot usage as CONGESTED
+- Prevents investing in congested channels where liquidity cannot be used
 
 ## Architecture
 
@@ -142,16 +161,20 @@ All options can be set via `lightning-cli` at startup or in your config file:
 | `revenue-ops-rebalancer` | `circular` | Rebalancer plugin (circular/sling) |
 | `revenue-ops-daily-budget-sats` | `5000` | Max rebalancing fees per 24 hours (sats) |
 | `revenue-ops-min-wallet-reserve` | `1000000` | Min total funds to keep in reserve (sats) |
+| `revenue-ops-metrics-port` | `9800` | Prometheus metrics HTTP port |
+| `revenue-ops-enable-reputation` | `true` | Enable peer reputation tracking |
+| `revenue-ops-htlc-congestion-threshold` | `0.8` | HTLC slot usage threshold (0.0-1.0) |
 | `revenue-ops-dry-run` | `false` | Log actions without executing |
 
-*Note: The Hill Climbing fee controller manages its own internal state (step size, direction) automatically. PID parameters are kept for legacy compatibility but are not actively used.*
+*Note: The Hill Climbing fee controller manages its own internal state (step size, direction, sleep mode) automatically.*
 
 Example config:
 
-```
+```ini
 # ~/.lightning/config
 revenue-ops-target-flow=200000
 revenue-ops-min-fee-ppm=50
+revenue-ops-metrics-port=9800
 revenue-ops-dry-run=true  # Test mode
 ```
 
@@ -257,8 +280,12 @@ Every 30 minutes (configurable), the plugin:
    - If Revenue Rate Increased: Keep going in the same direction
    - If Revenue Rate Decreased: Reverse direction (we went too far)
 5. **Dampening**: On direction reversal, reduce step size (wiggle dampening)
-6. Enforce floor (economic minimum) and ceiling constraints
-7. Apply profitability multipliers based on channel health
+6. **Deadband Hysteresis** (gossip noise reduction):
+   - If revenue rate change < 1% for 3 consecutive cycles: Enter sleep mode
+   - Sleep for 4x the fee interval (reduces `channel_update` broadcasts)
+   - Wake up immediately if revenue spikes >20%
+7. Enforce floor (economic minimum) and ceiling constraints
+8. Apply profitability multipliers based on channel health
 
 ### EV Rebalancing
 
@@ -347,11 +374,53 @@ The profitability analyzer tracks the economic performance of each channel:
 
 ## Monitoring
 
-Check the database for historical data:
+### Prometheus Metrics
+
+The plugin exposes Prometheus metrics on port 9800 (configurable). Add to your Prometheus config:
+
+```yaml
+scrape_configs:
+  - job_name: 'cl-revenue-ops'
+    static_configs:
+      - targets: ['localhost:9800']
+```
+
+Access metrics directly:
 
 ```bash
+curl http://localhost:9800/metrics
+```
+
+### Key Metrics for Grafana Dashboards
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cl_revenue_channel_fee_ppm` | Gauge | Current fee rate per channel |
+| `cl_revenue_channel_revenue_rate_sats_hr` | Gauge | Revenue rate in sats/hour |
+| `cl_revenue_channel_is_sleeping` | Gauge | 1 if in sleep mode (deadband hysteresis) |
+| `cl_revenue_channel_marginal_roi_percent` | Gauge | Marginal ROI percentage |
+| `cl_revenue_rebalance_cost_total_sats` | Counter | Total rebalancing costs |
+| `cl_revenue_peer_reputation_score` | Gauge | Peer success rate (0.0-1.0) |
+
+### Database Queries
+
+Check the SQLite database for historical data:
+
+```bash
+# Recent fee changes
 sqlite3 ~/.lightning/revenue_ops.db "SELECT * FROM fee_changes ORDER BY timestamp DESC LIMIT 10;"
+
+# Recent rebalances
 sqlite3 ~/.lightning/revenue_ops.db "SELECT * FROM rebalance_history ORDER BY timestamp DESC LIMIT 10;"
+
+# Channel profitability
+sqlite3 ~/.lightning/revenue_ops.db "SELECT * FROM channel_costs;"
+
+# Peer reputation scores
+sqlite3 ~/.lightning/revenue_ops.db "SELECT * FROM peer_reputation ORDER BY (success_count + failure_count) DESC LIMIT 20;"
+
+# Channels in sleep mode
+sqlite3 ~/.lightning/revenue_ops.db "SELECT channel_id, is_sleeping, sleep_until FROM fee_strategy_state WHERE is_sleeping = 1;"
 ```
 
 ## Troubleshooting
