@@ -7,41 +7,29 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
 
 - [x] **Global Daily Budgeting**: Implement a hard cap on total rebalancing fees paid per 24-hour rolling window.
 - [x] **Wallet Reserve Protection**: Suspend all operations if on-chain or off-chain liquid funds drop below a safe reserve threshold.
-- [ ] **Kelly Criterion Sizing**: (Optional) Dynamically scale rebalance budget based on the statistical certainty of the channel's revenue stream.
+- [x] **Kelly Criterion Sizing**: Dynamically scale rebalance budget based on the statistical certainty of the peer's reliability (Win Probability) and Profitability (Odds).
 
-## Phase 2: Observability (High Priority)
-*Objective: "You cannot manage what you cannot measure." Provide real-time visualization of algorithmic decisions.*
+## Phase 2: Observability (In Progress)
+*Objective: "You cannot manage what you cannot measure." Provide real-time visualization and auditing of algorithmic decisions.*
 
-- [x] **Prometheus Metrics Exporter**: Expose a local HTTP endpoint (or `.prom` file writer) to output time-series data:
-    - Current Fee PPM per channel
-    - Calculated Revenue Rate (sats/hr)
-    - Marginal ROI
-    - Rebalancing costs vs. Expected Profit
-- [ ] **Decision Logging**: Create a structured event log (JSON lines) separate from the debug log for auditing algorithmic choices / backtesting.
+- [x] **Prometheus Metrics Exporter**: Expose a local HTTP endpoint (or `.prom` file writer) to output time-series data.
+- [x] **Real-Time Metrics**: Updated event hooks to push metrics instantly, removing dashboard lag.
+- [ ] **Decision Logging**: Create a structured event log (`decisions.jsonl`) separate from the debug log for auditing *why* specific fee/rebalance decisions were made.
 
-## Phase 3: Traffic Intelligence (Core Completed)
+## Phase 3: Traffic Intelligence (Completed)
 *Objective: Optimize for quality liquidity and filter out noise/spam.*
 
-- [x] **HTLC Slot Awareness**: 
-    - Monitor `htlc_max_concurrent` usage.
-    - Mark channels with >80% (configurable) slot usage as `CONGESTED`.
-    - Prevent rebalancing into congested channels (liquidity cannot be used).
-- [x] **Reputation Tracking**:
-    - Track HTLC failure rates per peer in database.
-    - Resolve forward events to Peer IDs.
-- [x] **Reputation-Weighted Fees**:
-    - Discount volume from peers with high failure rates (spam/probing) in the Hill Climbing algorithm.
-    - Optimize fees based on *settled* revenue potential, not just attempted volume.
-- [ ] **Reputation Logic Refinements**:
-    - **Time-Windowing/Decay**: Implement a decay factor (e.g., multiply counts by 0.9 daily) so recent behavior outweighs ancient history.
-    - **Laplace Smoothing**: Apply statistical smoothing (e.g., `(success+1)/(total+2)`) to prevent extreme score swings on peers with low sample sizes.
+- [x] **HTLC Slot Awareness**: Monitor usage and mark congested channels (>80% utilization).
+- [x] **Reputation Tracking**: Track HTLC failure rates per peer in database.
+- [x] **Reputation-Weighted Fees**: Discount volume from spammy peers in the Hill Climbing algorithm.
+- [x] **Reputation Logic Refinements**: Implemented Laplace Smoothing and Time Decay.
 
 ## Phase 4: Stability & Scaling (In Progress)
 *Objective: Reduce network noise and handle high throughput.*
 
 - [x] **Deadband Hysteresis**:
     - Detect "Market Calm" (low revenue variance).
-    - Enter "Sleep Mode" for stable channels to reduce gossip noise (`channel_update` spam).
+    - Enter "Sleep Mode" for stable channels to reduce gossip noise.
     - Wake up immediately on revenue spikes.
 - [ ] **Async Job Queue**:
     - Refactor `rebalancer.py` to decouple decision-making from execution.

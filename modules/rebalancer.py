@@ -529,6 +529,63 @@ class EVRebalancer:
         max_budget_sats = (spread_ppm * rebalance_amount) // 1_000_000
         max_budget_msat = max_budget_sats * 1000
         
+        # KELLY CRITERION POSITION SIZING (Phase 4: Risk Management)
+        # Scale budget based on "Probability of Win" derived from peer reputation.
+        # This prevents betting full budget on unreliable peers.
+        #
+        # Kelly Formula: f = p - (1-p)/b
+        # where:
+        #   p = probability of success (peer reputation score)
+        #   b = odds (potential profit / cost of rebalance)
+        #   f = fraction of bankroll to bet
+        #
+        # We use "Half Kelly" (or user-configured fraction) to reduce volatility drag.
+        if self.config.enable_kelly:
+            dest_peer_id = dest_info.get("peer_id", "")
+            reputation = self.database.get_peer_reputation(dest_peer_id)
+            p = reputation.get('score', 0.5)  # Laplace-smoothed success rate
+            
+            # Calculate odds (b = potential profit / cost)
+            # Potential profit = outbound_fee_ppm (what we earn per routing)
+            # Cost = inbound_fee_ppm + weighted_opp_cost (what we pay to rebalance)
+            cost_ppm = inbound_fee_ppm + weighted_opp_cost
+            
+            # Division-by-zero protection
+            if cost_ppm > 0:
+                b = outbound_fee_ppm / cost_ppm
+            else:
+                b = float('inf')  # Free rebalance, infinite odds
+            
+            # Kelly fraction: f = p - (1-p)/b
+            # Protect against division by zero when b is very small
+            if b > 0:
+                kelly_f = p - (1 - p) / b
+            else:
+                kelly_f = -1.0  # Negative Kelly (don't bet)
+            
+            # Apply configured multiplier (Half Kelly by default)
+            kelly_safe = kelly_f * self.config.kelly_fraction
+            
+            # If Kelly fraction is zero or negative, the risk is too high - skip rebalance
+            if kelly_safe <= 0:
+                self.plugin.log(
+                    f"Skipping {dest_channel}: Kelly Criterion REJECT - "
+                    f"p={p:.2f}, b={b:.2f} -> f={kelly_f:.3f}, f_safe={kelly_safe:.3f}. "
+                    f"Risk too high for peer with reputation score {p:.2f}."
+                )
+                return None
+            
+            # Scale the budget by Kelly fraction (cap at 1.0 to never exceed original budget)
+            kelly_safe = min(kelly_safe, 1.0)
+            original_budget = max_budget_sats
+            max_budget_sats = int(max_budget_sats * kelly_safe)
+            max_budget_msat = max_budget_sats * 1000
+            
+            self.plugin.log(
+                f"Kelly Sizing: p={p:.2f}, b={b:.2f} -> f={kelly_f:.3f}. "
+                f"Scaling budget by {kelly_safe:.2%} ({original_budget} -> {max_budget_sats} sats)."
+            )
+
         # Calculate max fee as PPM for circular
         # This is the KEY constraint we pass to circular
         # Note: We use inbound_fee_ppm here since that's what we're actually paying

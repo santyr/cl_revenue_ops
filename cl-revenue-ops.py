@@ -204,6 +204,18 @@ plugin.add_option(
     description='Port for Prometheus HTTP metrics server (default: 9800)'
 )
 
+plugin.add_option(
+    name='revenue-ops-enable-kelly',
+    default='false',
+    description='If true, scale rebalance budget using Kelly Criterion based on peer reputation (default: false)'
+)
+
+plugin.add_option(
+    name='revenue-ops-kelly-fraction',
+    default='0.5',
+    description='Multiplier for Kelly fraction (default: 0.5 = Half Kelly). Full Kelly (1.0) maximizes growth but has high volatility.'
+)
+
 
 # =============================================================================
 # INITIALIZATION
@@ -248,7 +260,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
         reputation_decay=float(options['revenue-ops-reputation-decay']),
         enable_prometheus=options['revenue-ops-enable-prometheus'].lower() == 'true',
-        prometheus_port=int(options['revenue-ops-prometheus-port'])
+        prometheus_port=int(options['revenue-ops-prometheus-port']),
+        enable_kelly=options['revenue-ops-enable-kelly'].lower() == 'true',
+        kelly_fraction=float(options['revenue-ops-kelly-fraction'])
     )
     
     plugin.log(f"Configuration loaded: target_flow={config.target_flow}, "

@@ -82,6 +82,12 @@ class Config:
     enable_prometheus: bool = False  # If True, start Prometheus metrics exporter (disabled by default)
     prometheus_port: int = 9800      # Port for Prometheus HTTP server
     
+    # Kelly Criterion Position Sizing (Phase 4: Risk Management)
+    enable_kelly: bool = False       # If True, scale rebalance budget by Kelly fraction
+    kelly_fraction: float = 0.5      # Multiplier for Kelly fraction ("Half Kelly" is standard)
+                                      # Full Kelly (1.0) maximizes growth but has high volatility
+                                      # Half Kelly (0.5) reduces volatility drag significantly
+    
     # Safety flags
     dry_run: bool = False          # If True, log but don't execute
 
