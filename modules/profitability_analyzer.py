@@ -848,8 +848,7 @@ class ChannelProfitabilityAnalyzer:
         
         Detection criteria:
         - open_cost >= capacity_sats (impossible - fee can't exceed channel size)
-        - open_cost > 25% of capacity for large channels (>1M sats)
-        - open_cost > 50% of capacity for smaller channels
+        - open_cost >= 90% of capacity (almost certainly the funding amount)
         
         Args:
             channel_id: Channel short ID
@@ -861,29 +860,17 @@ class ChannelProfitabilityAnalyzer:
         Returns:
             Corrected open_cost value (either validated original, re-queried, or fallback)
         """
-        # Determine threshold based on channel size
-        # Large channels (>1M sats): fee should be < 25% of capacity
-        # Smaller channels: fee should be < 50% of capacity
-        # In practice, on-chain fees are typically 0.1-2% of capacity
-        if capacity_sats > 1_000_000:
-            max_reasonable_fee_ratio = 0.25
-        else:
-            max_reasonable_fee_ratio = 0.50
-        
-        max_reasonable_fee = int(capacity_sats * max_reasonable_fee_ratio)
-        
-        # Check if open_cost is suspiciously high
-        is_invalid = (
-            open_cost >= capacity_sats or  # Fee >= capacity (definitely wrong)
-            open_cost > max_reasonable_fee  # Fee unreasonably high for channel size
-        )
+        # Only flag as invalid if open_cost is >= 90% of capacity
+        # This is a clear indicator that the funding amount was recorded as fee
+        # Normal on-chain fees are typically 0.1-5% of channel size at most
+        is_invalid = open_cost >= (capacity_sats * 0.90)
         
         if not is_invalid:
             return open_cost  # Value looks reasonable
         
         # DETECTED INVALID OPEN COST - trigger self-healing
         self.plugin.log(
-            f"⚠️  SANITY CHECK: Detected invalid open_cost for {channel_id}: "
+            f"SANITY CHECK: Detected invalid open_cost for {channel_id}: "
             f"{open_cost} sats (capacity: {capacity_sats} sats). "
             f"Capital likely counted as expense. Triggering recalculation.",
             level='warn'
@@ -894,34 +881,25 @@ class ChannelProfitabilityAnalyzer:
         if funding_txid:
             corrected_cost = self._get_open_cost_from_bookkeeper(funding_txid, capacity_sats)
         
-        # Step 2: Validate the re-queried value
-        if corrected_cost is not None:
-            # Check if re-query also returns a value close to capacity (within 5%)
-            if corrected_cost >= capacity_sats * 0.95:
-                self.plugin.log(
-                    f"⚠️  Re-query still returned invalid value ({corrected_cost} sats). "
-                    f"Discarding and using fallback.",
-                    level='warn'
-                )
-                corrected_cost = None
-            elif corrected_cost > max_reasonable_fee:
-                self.plugin.log(
-                    f"⚠️  Re-query returned suspicious value ({corrected_cost} sats). "
-                    f"Discarding and using fallback.",
-                    level='warn'
-                )
-                corrected_cost = None
+        # Step 2: Validate the re-queried value - reject if still >= 90% of capacity
+        if corrected_cost is not None and corrected_cost >= (capacity_sats * 0.90):
+            self.plugin.log(
+                f"Re-query still returned invalid value ({corrected_cost} sats). "
+                f"Discarding and using fallback.",
+                level='warn'
+            )
+            corrected_cost = None
         
         # Step 3: Use fallback if re-query failed or still invalid
         if corrected_cost is None:
             corrected_cost = self.config.estimated_open_cost_sats
             self.plugin.log(
-                f"✓ Using fallback estimated_open_cost_sats: {corrected_cost} sats",
+                f"Using fallback estimated_open_cost_sats: {corrected_cost} sats",
                 level='info'
             )
         else:
             self.plugin.log(
-                f"✓ Corrected open_cost for {channel_id}: {corrected_cost} sats "
+                f"Corrected open_cost for {channel_id}: {corrected_cost} sats "
                 f"(was: {open_cost} sats)",
                 level='info'
             )
@@ -931,8 +909,8 @@ class ChannelProfitabilityAnalyzer:
             channel_id, peer_id, corrected_cost, capacity_sats
         )
         self.plugin.log(
-            f"✓ Database updated with corrected open_cost for {channel_id}",
-            level='info'
+            f"Database updated with corrected open_cost for {channel_id}",
+            level='debug'
         )
         
         return corrected_cost
@@ -1033,11 +1011,6 @@ class ChannelProfitabilityAnalyzer:
         This catches the bug where bookkeeper returns the channel capacity
         (funding output) instead of the actual on-chain mining fee.
         
-        Validation rules:
-        1. Fee cannot equal or exceed channel capacity (it's the funding amount!)
-        2. Fee should be reasonable relative to capacity (typically < 5% for most cases)
-        3. Fee should be within reasonable absolute bounds (typically 100 - 100,000 sats)
-        
         Args:
             fee_sats: The fee amount to validate
             capacity_sats: Channel capacity in sats
@@ -1046,43 +1019,19 @@ class ChannelProfitabilityAnalyzer:
         Returns:
             True if fee appears valid, False if it looks like funding amount
         """
-        # If we don't have capacity info, be more lenient but still catch extreme cases
+        # If we don't have capacity info, accept any reasonable value
         if capacity_sats <= 0:
-            # Without capacity, only reject extremely high values (> 1 BTC in fees is suspicious)
-            if fee_sats > 100_000_000:  # 1 BTC
-                self.plugin.log(
-                    f"Rejecting suspiciously high fee ({fee_sats} sats) for {funding_txid}: "
-                    f"exceeds 1 BTC, likely not a mining fee",
-                    level='warn'
-                )
-                return False
             return True
         
-        # Rule 1: Fee cannot equal channel capacity (this IS the funding amount, not fee)
-        # Use 5% tolerance to catch values close to capacity
-        if fee_sats >= capacity_sats * 0.95:
+        # Reject if fee >= 90% of capacity - this is clearly the funding amount
+        if fee_sats >= capacity_sats * 0.90:
             self.plugin.log(
                 f"Rejecting invalid fee ({fee_sats} sats) for {funding_txid}: "
-                f"equals/exceeds 95% of capacity ({capacity_sats} sats). "
-                f"This is the funding output, not the mining fee!",
-                level='warn'
-            )
-            return False
-        
-        # Rule 2: Fee should be reasonable relative to capacity
-        # Typical on-chain fees are 0.1% - 3% of channel size
-        # Be generous and allow up to 10% for high-fee environments
-        max_reasonable_fee_ratio = 0.10
-        if fee_sats > capacity_sats * max_reasonable_fee_ratio:
-            # This is suspicious but could be valid in extreme fee environments
-            # Log warning but still accept (the sanity check in _get_channel_costs
-            # will catch truly problematic cases)
-            self.plugin.log(
-                f"Warning: High fee ratio detected for {funding_txid}: "
-                f"{fee_sats} sats is {(fee_sats/capacity_sats)*100:.1f}% of capacity. "
-                f"Accepting but flagging for review.",
+                f"equals/exceeds 90% of capacity ({capacity_sats} sats). "
+                f"This is likely the funding output, not the mining fee.",
                 level='debug'
             )
+            return False
         
         return True
     
