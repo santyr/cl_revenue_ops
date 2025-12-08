@@ -188,8 +188,8 @@ plugin.add_option(
 
 plugin.add_option(
     name='revenue-ops-enable-prometheus',
-    default='true',
-    description='If true, start Prometheus metrics exporter HTTP server (default: true)'
+    default='false',
+    description='If true, start Prometheus metrics exporter HTTP server (default: false)'
 )
 
 plugin.add_option(

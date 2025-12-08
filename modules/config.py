@@ -77,8 +77,8 @@ class Config:
     enable_reputation: bool = True  # If True, weight volume by peer success rate
     
     # Prometheus Metrics (Phase 2: Observability)
-    enable_prometheus: bool = True  # If True, start Prometheus metrics exporter
-    prometheus_port: int = 9800     # Port for Prometheus HTTP server
+    enable_prometheus: bool = False  # If True, start Prometheus metrics exporter (disabled by default)
+    prometheus_port: int = 9800      # Port for Prometheus HTTP server
     
     # Safety flags
     dry_run: bool = False          # If True, log but don't execute
