@@ -358,7 +358,7 @@ class EVRebalancer:
             return None
         
         # Check channel profitability if analyzer is available
-        # Skip or deprioritize underwater/zombie channels
+        # Skip or deprioritize underwater/zombie channels based on MARGINAL ROI
         channel_profitability = None
         if self._profitability_analyzer:
             try:
@@ -366,7 +366,7 @@ class EVRebalancer:
                 if channel_profitability:
                     profitability_class = channel_profitability.classification.value
                     
-                    # ZOMBIE channels: No routing activity - don't invest more
+                    # ZOMBIE channels: No routing activity for 30+ days - don't invest more
                     if profitability_class == "zombie":
                         self.plugin.log(
                             f"Skipping {dest_channel}: ZOMBIE channel has no routing activity. "
@@ -374,21 +374,36 @@ class EVRebalancer:
                         )
                         return None
                     
-                    # UNDERWATER channels: Negative ROI - be cautious
+                    # UNDERWATER channels: Negative Total ROI - check MARGINAL ROI
+                    # Total ROI includes sunk on-chain opening costs, which can make
+                    # new/empty channels appear unprofitable even if they would cover
+                    # their rebalancing costs. This is the "Liquidity Trap".
+                    #
+                    # Solution: Evaluate Marginal ROI (Operational Profitability)
+                    # - If marginal_roi > 0: Channel covers its rebalancing costs - ALLOW
+                    # - If marginal_roi <= 0: Channel loses money on every operation - SKIP
                     if profitability_class == "underwater":
-                        # Only skip if deeply underwater (ROI < -50%)
-                        if channel_profitability.roi_percent < -50:
+                        marginal_roi = channel_profitability.marginal_roi
+                        marginal_roi_pct = channel_profitability.marginal_roi_percent
+                        total_roi_pct = channel_profitability.roi_percent
+                        
+                        if marginal_roi > 0:
+                            # Channel is operationally profitable - covers rebalancing costs
+                            # The negative Total ROI is just sunk cost (opening fees)
                             self.plugin.log(
-                                f"Skipping {dest_channel}: deeply UNDERWATER channel "
-                                f"(ROI={channel_profitability.roi_percent:.1f}%). "
-                                f"Fix economics before rebalancing."
+                                f"Channel {dest_channel} is UNDERWATER (Total ROI={total_roi_pct:.1f}%) "
+                                f"but OPERATIONALLY PROFITABLE (Marginal ROI={marginal_roi_pct:.1f}%). "
+                                f"Allowing rebalance - channel covers its costs."
+                            )
+                            # Continue with rebalance - don't return None
+                        else:
+                            # Channel loses money on every operation - skip it
+                            self.plugin.log(
+                                f"Skipping {dest_channel}: UNDERWATER channel with NEGATIVE marginal ROI "
+                                f"(Total ROI={total_roi_pct:.1f}%, Marginal ROI={marginal_roi_pct:.1f}%). "
+                                f"Channel loses money on every operation. Fix economics first."
                             )
                             return None
-                        else:
-                            self.plugin.log(
-                                f"Channel {dest_channel} is UNDERWATER (ROI={channel_profitability.roi_percent:.1f}%) "
-                                f"but proceeding with caution."
-                            )
             except Exception as e:
                 self.plugin.log(f"Error checking profitability for {dest_channel}: {e}")
         
