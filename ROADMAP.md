@@ -1,4 +1,4 @@
-# cl-revenue-ops Roadmap: Enterprise Grade
+# cl-revenue-ops Roadmap:
 
 This document outlines the development path to move `cl-revenue-ops` from a "Power User" tool to an "Enterprise Grade" routing engine suitable for managing high-liquidity nodes.
 
