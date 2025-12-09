@@ -7,49 +7,22 @@ This module implements Expected Value (EV) based rebalancing decisions.
 Unlike clboss which often makes negative EV rebalances, this module only
 triggers rebalances when the math shows positive expected profit.
 
-Architecture Pattern: "Strategist and Driver"
-- THIS MODULE (Strategist): Calculates EV, determines IF and HOW MUCH to rebalance
-- CIRCULAR PLUGIN (Driver): Actually executes the circular payment
+Architecture Pattern: "Strategist, Manager, and Driver"
+- STRATEGIST (EVRebalancer): Calculates EV, determines IF and HOW MUCH to rebalance
+- MANAGER (JobManager): Manages lifecycle of background sling jobs
+- DRIVER (Sling plugin): Actually executes the payments in the background
 
-We call circular via RPC - we don't import it. This module is the "Business Logic"
-layer that tells circular: "Move money from A to B if done below X ppm. Go."
-
-Expected Value Theory for Rebalancing:
-- Rebalancing moves liquidity from one channel to another
-- It costs fees to move the liquidity
-- It earns potential future routing fees from the refilled channel
-- BUT: Draining the source channel has an OPPORTUNITY COST
-- EV = Expected_Future_Fees - Rebalancing_Cost - Opportunity_Cost
-
-NEW: Dynamic Utilization & Opportunity Cost:
-1. OLD: Static 10% utilization estimate (unrealistic)
-2. NEW: Dynamic turnover_rate = daily_volume / capacity
-   - Uses actual channel performance to project revenue
-   
-3. OLD Spread: Dest_Fee - Inbound_Rebalance_Cost
-4. NEW Spread: Dest_Fee - (Inbound_Rebalance_Cost + Source_Fee)
-   - We're "selling" liquidity from Source to "buy" liquidity on Dest
-   - If Source earns 500ppm and Dest earns 600ppm with 200ppm rebalance cost,
-     that's actually a NET LOSS (600 - 200 - 500 = -100ppm)
-
-CRITICAL FLOW STATE LOGIC:
-- If Target Channel is SINK: ABORT rebalance!
-  (Why pay fees to fill a channel that fills itself for free via routing?)
-- If Target Channel is SOURCE: HIGH PRIORITY rebalance!
-  (This channel prints money; keep it full)
-
-Anti-Thrashing Protection:
-- After successful rebalance, unmanage peer from clboss for extended duration
-- This prevents clboss from immediately "fixing" our work and wasting fees
-
-The key insight: We should never pay more to rebalance than we expect
-to earn from the restored capacity MINUS the opportunity cost of the
-liquidity we're draining from the source channel.
+Phase 4: Async Job Queue
+- Decouples decision-making from execution
+- Allows concurrent rebalancing attempts
+- Uses sling-job (background) instead of sling-once (blocking)
 """
 
 import time
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING
+from enum import Enum
 
 from pyln.client import Plugin, RpcError
 
@@ -62,32 +35,19 @@ if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
 
 
+class JobStatus(Enum):
+    """Status of a sling background job."""
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+    STOPPED = "stopped"
+
+
 @dataclass
 class RebalanceCandidate:
-    """
-    A candidate for rebalancing.
-    
-    Attributes:
-        from_channel: Channel with excess liquidity (source)
-        to_channel: Channel needing liquidity (destination)
-        from_peer_id: Peer ID of source channel
-        to_peer_id: Peer ID of destination channel
-        amount_sats: Amount to rebalance
-        amount_msat: Amount in millisatoshis (for RPC calls)
-        outbound_fee_ppm: Fee we charge on destination channel
-        inbound_fee_ppm: Estimated fee to route to us
-        source_fee_ppm: Fee we charge on source channel (raw opportunity cost)
-        weighted_opp_cost_ppm: Opportunity cost weighted by source turnover (7-day projection)
-        spread_ppm: Net spread after weighted opportunity cost
-        max_budget_sats: Maximum fee we should pay
-        max_budget_msat: Maximum fee in msat (for RPC calls)
-        max_fee_ppm: Maximum fee as PPM (for circular)
-        expected_profit_sats: Expected profit if rebalanced
-        liquidity_ratio: Current outbound ratio on destination
-        dest_flow_state: Flow state of destination (SOURCE/SINK/BALANCED)
-        dest_turnover_rate: Daily volume / capacity for destination
-        source_turnover_rate: Daily volume / capacity for source
-    """
+    """A candidate for rebalancing."""
     from_channel: str
     to_channel: str
     from_peer_id: str
@@ -97,7 +57,7 @@ class RebalanceCandidate:
     outbound_fee_ppm: int
     inbound_fee_ppm: int
     source_fee_ppm: int
-    weighted_opp_cost_ppm: int  # NEW: Weighted opportunity cost (source_fee * turnover_weight)
+    weighted_opp_cost_ppm: int
     spread_ppm: int
     max_budget_sats: int
     max_budget_msat: int
@@ -132,58 +92,513 @@ class RebalanceCandidate:
         }
 
 
+@dataclass
+class ActiveJob:
+    """Tracks an active sling background job."""
+    scid: str                      # Target channel SCID (colon format for sling)
+    scid_normalized: str           # Original SCID format (for our tracking)
+    from_scid: str                 # Source channel SCID
+    start_time: int                # Unix timestamp when job started
+    candidate: RebalanceCandidate  # Original candidate data
+    rebalance_id: int              # Database record ID
+    target_amount_sats: int        # Total amount we want to rebalance
+    initial_local_sats: int        # Local balance when job started
+    max_fee_ppm: int               # Max fee rate for this job
+    status: JobStatus = JobStatus.PENDING
+
+
+class JobManager:
+    """
+    Manages the lifecycle of Sling background rebalancing jobs.
+    
+    Responsibilities:
+    - Start new sling-job workers
+    - Monitor job progress via sling-stats
+    - Stop jobs on success, timeout, or error
+    - Record results to database
+    
+    Key Design Decision:
+    We use sling-job for TACTICAL rebalancing (one-off moves), not permanent
+    pegging. As soon as any successful payment is detected or timeout is reached,
+    we DELETE the job to prevent infinite spending.
+    """
+    
+    # Default timeout: 2 hours (configurable)
+    DEFAULT_JOB_TIMEOUT_SECONDS = 7200
+    
+    def __init__(self, plugin: Plugin, config: Config, database: Database,
+                 metrics_exporter: Optional[PrometheusExporter] = None):
+        self.plugin = plugin
+        self.config = config
+        self.database = database
+        self.metrics = metrics_exporter
+        
+        # Active jobs indexed by target channel SCID (normalized format)
+        self._active_jobs: Dict[str, ActiveJob] = {}
+        
+        # Configurable settings
+        self.job_timeout_seconds = getattr(config, 'sling_job_timeout_seconds', 
+                                           self.DEFAULT_JOB_TIMEOUT_SECONDS)
+        self.max_concurrent_jobs = getattr(config, 'max_concurrent_jobs', 5)
+        
+        # Chunk size for sling rebalances (sats per attempt)
+        self.chunk_size_sats = getattr(config, 'sling_chunk_size_sats', 500000)
+    
+    @property
+    def active_job_count(self) -> int:
+        """Returns the number of currently active jobs."""
+        return len(self._active_jobs)
+    
+    @property
+    def active_channels(self) -> List[str]:
+        """Returns list of channel SCIDs with active jobs."""
+        return list(self._active_jobs.keys())
+    
+    def has_active_job(self, channel_id: str) -> bool:
+        """Check if a channel has an active rebalance job."""
+        normalized = self._normalize_scid(channel_id)
+        return normalized in self._active_jobs
+    
+    def slots_available(self) -> int:
+        """Returns number of available job slots."""
+        return max(0, self.max_concurrent_jobs - self.active_job_count)
+    
+    def _normalize_scid(self, scid: str) -> str:
+        """Normalize SCID to consistent format (with 'x' separators)."""
+        return scid.replace(':', 'x')
+    
+    def _to_sling_scid(self, scid: str) -> str:
+        """Convert SCID to sling's expected colon format."""
+        return scid.replace('x', ':')
+    
+    def _get_channel_local_balance(self, channel_id: str) -> int:
+        """Get current local balance of a channel in sats."""
+        try:
+            listfunds = self.plugin.rpc.listfunds()
+            normalized = self._normalize_scid(channel_id)
+            
+            for channel in listfunds.get("channels", []):
+                scid = channel.get("short_channel_id", "")
+                if self._normalize_scid(scid) == normalized:
+                    our_amount_msat = channel.get("our_amount_msat", 0)
+                    if isinstance(our_amount_msat, str):
+                        our_amount_msat = int(our_amount_msat.replace("msat", ""))
+                    return our_amount_msat // 1000
+        except Exception as e:
+            self.plugin.log(f"Error getting channel balance: {e}", level='debug')
+        return 0
+    
+    def start_job(self, candidate: RebalanceCandidate, rebalance_id: int) -> Dict[str, Any]:
+        """
+        Start a new sling-job for the given candidate.
+        
+        sling-job creates a persistent background worker that will keep
+        attempting to rebalance until stopped or target is reached.
+        
+        Args:
+            candidate: The rebalance candidate with all parameters
+            rebalance_id: Database record ID for this rebalance attempt
+            
+        Returns:
+            Dict with 'success' bool and 'message' or 'error'
+        """
+        normalized_scid = self._normalize_scid(candidate.to_channel)
+        
+        # Check if job already exists
+        if normalized_scid in self._active_jobs:
+            return {"success": False, "error": "Job already exists for this channel"}
+        
+        # Check slot availability
+        if self.active_job_count >= self.max_concurrent_jobs:
+            return {"success": False, "error": "No job slots available"}
+        
+        # Convert SCIDs to sling format (colon-separated)
+        to_scid = self._to_sling_scid(candidate.to_channel)
+        from_scid = self._to_sling_scid(candidate.from_channel)
+        
+        # Get initial balance for progress tracking
+        initial_balance = self._get_channel_local_balance(candidate.to_channel)
+        
+        # Calculate chunk size (amount per rebalance attempt)
+        chunk_size = min(candidate.amount_sats, self.chunk_size_sats)
+        
+        try:
+            # Build candidates JSON array
+            candidates_json = json.dumps([from_scid])
+            
+            self.plugin.log(
+                f"Starting sling-job: {to_scid} <- {from_scid}, "
+                f"amount={chunk_size}, maxppm={candidate.max_fee_ppm}, "
+                f"target_total={candidate.amount_sats}"
+            )
+            
+            # Start sling-job with keyword arguments
+            # sling-job -k scid=X direction=pull amount=Y maxppm=Z candidates='["A"]'
+            self.plugin.rpc.call("sling-job", {
+                "scid": to_scid,
+                "direction": "pull",
+                "amount": chunk_size,
+                "maxppm": candidate.max_fee_ppm,
+                "candidates": candidates_json,
+                "target": 0.5  # Stop when 50% balance reached (we'll stop earlier ourselves)
+            })
+            
+            # Start the job (sling-job only creates it, sling-go starts it)
+            try:
+                self.plugin.rpc.call("sling-go", {"scid": to_scid})
+            except RpcError as e:
+                # sling-go might fail if job auto-started, that's OK
+                if "already running" not in str(e).lower():
+                    self.plugin.log(f"sling-go warning: {e}", level='debug')
+            
+            # Track the job
+            job = ActiveJob(
+                scid=to_scid,
+                scid_normalized=normalized_scid,
+                from_scid=from_scid,
+                start_time=int(time.time()),
+                candidate=candidate,
+                rebalance_id=rebalance_id,
+                target_amount_sats=candidate.amount_sats,
+                initial_local_sats=initial_balance,
+                max_fee_ppm=candidate.max_fee_ppm,
+                status=JobStatus.RUNNING
+            )
+            self._active_jobs[normalized_scid] = job
+            
+            self.plugin.log(f"Sling job started for {to_scid}, tracking as {normalized_scid}")
+            
+            return {"success": True, "message": f"Job started for {to_scid}"}
+            
+        except RpcError as e:
+            error_msg = str(e)
+            self.plugin.log(f"Failed to start sling-job: {error_msg}", level='warn')
+            return {"success": False, "error": f"Sling RPC error: {error_msg}"}
+        except Exception as e:
+            self.plugin.log(f"Error starting sling-job: {e}", level='error')
+            return {"success": False, "error": str(e)}
+    
+    def stop_job(self, channel_id: str, reason: str = "manual") -> bool:
+        """
+        Stop and delete a sling job.
+        
+        Args:
+            channel_id: Channel SCID (any format)
+            reason: Why the job is being stopped (for logging)
+            
+        Returns:
+            True if job was stopped, False if not found or error
+        """
+        normalized = self._normalize_scid(channel_id)
+        job = self._active_jobs.get(normalized)
+        
+        if not job:
+            return False
+        
+        try:
+            # First stop the job gracefully
+            try:
+                self.plugin.rpc.call("sling-stop", {"scid": job.scid})
+            except RpcError:
+                pass  # May already be stopped
+            
+            # Then delete it to prevent restart
+            try:
+                self.plugin.rpc.call("sling-deletejob", {
+                    "job": job.scid,
+                    "delete_stats": False  # Keep stats for analysis
+                })
+            except RpcError as e:
+                self.plugin.log(f"sling-deletejob warning: {e}", level='debug')
+            
+            self.plugin.log(f"Stopped sling job {job.scid} (reason: {reason})")
+            
+        except Exception as e:
+            self.plugin.log(f"Error stopping job {job.scid}: {e}", level='warn')
+        
+        # Remove from tracking regardless
+        del self._active_jobs[normalized]
+        return True
+    
+    def monitor_jobs(self) -> Dict[str, Any]:
+        """
+        Monitor all active jobs and handle completed/failed/timed-out ones.
+        
+        This should be called periodically (e.g., every rebalance interval).
+        
+        Returns:
+            Summary dict with counts of various outcomes
+        """
+        summary = {
+            "checked": 0,
+            "completed": 0,
+            "failed": 0,
+            "timed_out": 0,
+            "still_running": 0
+        }
+        
+        if not self._active_jobs:
+            return summary
+        
+        # Get current time for timeout checks
+        now = int(time.time())
+        
+        # Get sling stats for all jobs
+        sling_stats = self._get_sling_stats()
+        
+        # Copy keys to avoid modifying dict during iteration
+        job_scids = list(self._active_jobs.keys())
+        
+        for normalized_scid in job_scids:
+            job = self._active_jobs.get(normalized_scid)
+            if not job:
+                continue
+                
+            summary["checked"] += 1
+            
+            # Check timeout first
+            elapsed = now - job.start_time
+            if elapsed > self.job_timeout_seconds:
+                self._handle_job_timeout(job)
+                summary["timed_out"] += 1
+                continue
+            
+            # Check current channel balance for progress
+            current_balance = self._get_channel_local_balance(job.scid_normalized)
+            amount_transferred = current_balance - job.initial_local_sats
+            
+            # Get job-specific stats from sling
+            job_stats = sling_stats.get(job.scid, {})
+            
+            # Check for success: any positive transfer means we've achieved something
+            if amount_transferred > 0:
+                self._handle_job_success(job, amount_transferred, job_stats)
+                summary["completed"] += 1
+                continue
+            
+            # Check for sling-reported errors
+            if self._check_job_error(job, job_stats):
+                self._handle_job_failure(job, job_stats)
+                summary["failed"] += 1
+                continue
+            
+            # Job still running
+            summary["still_running"] += 1
+            self.plugin.log(
+                f"Job {job.scid} running: {elapsed}s elapsed, "
+                f"transferred={amount_transferred} sats",
+                level='debug'
+            )
+        
+        return summary
+    
+    def _get_sling_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Query sling-stats for all jobs and return as dict keyed by SCID."""
+        stats = {}
+        try:
+            # sling-stats with json=true returns structured data
+            result = self.plugin.rpc.call("sling-stats", {"json": True})
+            
+            if isinstance(result, dict):
+                # Result might be keyed by SCID or be a list
+                if "jobs" in result:
+                    for job in result["jobs"]:
+                        scid = job.get("scid", "")
+                        if scid:
+                            stats[scid] = job
+                else:
+                    # Assume dict is already keyed by SCID
+                    stats = result
+            elif isinstance(result, list):
+                for job in result:
+                    scid = job.get("scid", "")
+                    if scid:
+                        stats[scid] = job
+                        
+        except RpcError as e:
+            self.plugin.log(f"sling-stats error: {e}", level='debug')
+        except Exception as e:
+            self.plugin.log(f"Error getting sling stats: {e}", level='debug')
+        
+        return stats
+    
+    def _check_job_error(self, job: ActiveJob, stats: Dict[str, Any]) -> bool:
+        """Check if sling reports an error state for this job."""
+        # Check for explicit error status
+        status = stats.get("status", "").lower()
+        if status in ("error", "failed", "stopped"):
+            return True
+        
+        # Check for high consecutive failure count
+        consecutive_failures = stats.get("consecutive_failures", 0)
+        if consecutive_failures >= 10:
+            return True
+        
+        return False
+    
+    def _handle_job_success(self, job: ActiveJob, amount_transferred: int, 
+                            stats: Dict[str, Any]) -> None:
+        """Handle a successfully completed job."""
+        # Calculate actual fee paid (from sling stats if available)
+        fee_sats = stats.get("fee_total_sats", 0)
+        if not fee_sats:
+            fee_msat = stats.get("fee_total_msat", 0)
+            fee_sats = fee_msat // 1000 if fee_msat else 0
+        
+        # Estimate fee from amount if sling doesn't report it
+        if fee_sats == 0 and amount_transferred > 0:
+            # Use a conservative estimate based on max_fee_ppm
+            fee_sats = (amount_transferred * job.max_fee_ppm) // 1_000_000
+        
+        # Calculate actual profit
+        expected_profit = job.candidate.expected_profit_sats
+        actual_profit = expected_profit - fee_sats
+        
+        self.plugin.log(
+            f"Rebalance SUCCESS: {job.scid} filled with {amount_transferred} sats. "
+            f"Fee: {fee_sats} sats, Profit: {actual_profit} sats"
+        )
+        
+        # Update database
+        self.database.update_rebalance_result(
+            job.rebalance_id, 
+            'success', 
+            fee_sats, 
+            actual_profit
+        )
+        self.database.reset_failure_count(job.scid_normalized)
+        
+        # Update metrics
+        if self.metrics:
+            self.metrics.inc_counter(
+                MetricNames.REBALANCE_COST_TOTAL_SATS, 
+                fee_sats, 
+                {"channel_id": job.scid_normalized}
+            )
+        
+        # Stop the job
+        self.stop_job(job.scid_normalized, reason="success")
+    
+    def _handle_job_failure(self, job: ActiveJob, stats: Dict[str, Any]) -> None:
+        """Handle a failed job."""
+        error_msg = stats.get("last_error", "Unknown error from sling")
+        
+        self.plugin.log(
+            f"Rebalance FAILED: {job.scid} - {error_msg}",
+            level='warn'
+        )
+        
+        # Update database
+        self.database.update_rebalance_result(
+            job.rebalance_id,
+            'failed',
+            error_message=error_msg
+        )
+        self.database.increment_failure_count(job.scid_normalized)
+        
+        # Stop the job
+        self.stop_job(job.scid_normalized, reason="failure")
+    
+    def _handle_job_timeout(self, job: ActiveJob) -> None:
+        """Handle a timed-out job."""
+        elapsed_hours = (int(time.time()) - job.start_time) / 3600
+        
+        # Check if any progress was made
+        current_balance = self._get_channel_local_balance(job.scid_normalized)
+        amount_transferred = current_balance - job.initial_local_sats
+        
+        if amount_transferred > 0:
+            # Partial success - still record the progress
+            self.plugin.log(
+                f"Rebalance TIMEOUT (partial): {job.scid} after {elapsed_hours:.1f}h. "
+                f"Transferred {amount_transferred} sats before timeout."
+            )
+            self.database.update_rebalance_result(
+                job.rebalance_id,
+                'partial',
+                fee_paid_sats=0,  # Unknown actual fee
+                actual_profit_sats=0
+            )
+        else:
+            self.plugin.log(
+                f"Rebalance TIMEOUT: {job.scid} after {elapsed_hours:.1f}h with no progress",
+                level='warn'
+            )
+            self.database.update_rebalance_result(
+                job.rebalance_id,
+                'timeout',
+                error_message=f"Timeout after {elapsed_hours:.1f} hours"
+            )
+            self.database.increment_failure_count(job.scid_normalized)
+        
+        # Stop the job
+        self.stop_job(job.scid_normalized, reason="timeout")
+    
+    def stop_all_jobs(self, reason: str = "shutdown") -> int:
+        """Stop all active jobs. Returns count of jobs stopped."""
+        count = 0
+        for scid in list(self._active_jobs.keys()):
+            if self.stop_job(scid, reason=reason):
+                count += 1
+        return count
+    
+    def get_job_status(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Get status info for a specific job."""
+        normalized = self._normalize_scid(channel_id)
+        job = self._active_jobs.get(normalized)
+        
+        if not job:
+            return None
+        
+        elapsed = int(time.time()) - job.start_time
+        current_balance = self._get_channel_local_balance(normalized)
+        transferred = current_balance - job.initial_local_sats
+        
+        return {
+            "scid": job.scid,
+            "from_scid": job.from_scid,
+            "status": job.status.value,
+            "elapsed_seconds": elapsed,
+            "target_amount_sats": job.target_amount_sats,
+            "transferred_sats": transferred,
+            "progress_pct": round(transferred / job.target_amount_sats * 100, 1) if job.target_amount_sats > 0 else 0,
+            "max_fee_ppm": job.max_fee_ppm
+        }
+    
+    def get_all_jobs_status(self) -> List[Dict[str, Any]]:
+        """Get status info for all active jobs."""
+        return [
+            self.get_job_status(scid) 
+            for scid in self._active_jobs.keys()
+            if self.get_job_status(scid)
+        ]
+
+
 class EVRebalancer:
     """
-    Expected Value based rebalancer.
+    Expected Value based rebalancer with async job queue support.
     
-    Only executes rebalances when the expected profit is positive.
-    
-    Key Principles:
-    1. Fee Spread: Only rebalance if our outbound fee > inbound routing cost
-    2. Budget Cap: Never pay more than the spread allows
-    3. Minimum Profit: Require minimum profit threshold to justify complexity
-    4. Liquidity Awareness: Focus on channels that need liquidity most
+    This class acts as the "Strategist" - it calculates EV and determines
+    IF and HOW MUCH to rebalance. The actual execution is delegated to
+    the JobManager which manages sling background jobs.
     """
     
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  clboss_manager: ClbossManager,
                  metrics_exporter: Optional[PrometheusExporter] = None):
-        """
-        Initialize the rebalancer.
-        
-        Args:
-            plugin: Reference to the pyln Plugin
-            config: Configuration object
-            database: Database instance
-            clboss_manager: ClbossManager for handling overrides
-            metrics_exporter: Optional Prometheus metrics exporter for observability
-        """
         self.plugin = plugin
         self.config = config
         self.database = database
         self.clboss = clboss_manager
         self.metrics = metrics_exporter
-        
-        # Track pending rebalances to avoid duplicates
-        self._pending: Dict[str, int] = {}  # channel_id -> timestamp
-        
-        # NOTE: Failure counts are now persisted to database (channel_failures table)
-        # to survive plugin restarts and prevent "retry storms"
-        # Use self.database.get_failure_count(), increment_failure_count(), etc.
-        
-        # Cache our node ID (fetched lazily on first use)
+        self._pending: Dict[str, int] = {}
         self._our_node_id: Optional[str] = None
-        
-        # Optional profitability analyzer - set via setter to avoid circular imports
         self._profitability_analyzer: Optional['ChannelProfitabilityAnalyzer'] = None
+        
+        # Initialize job manager for async execution
+        self.job_manager = JobManager(plugin, config, database, metrics_exporter)
     
     def _get_our_node_id(self) -> str:
-        """
-        Get our node ID, caching it for future use.
-        
-        Returns:
-            Our node's public key (hex string)
-        """
         if self._our_node_id is None:
             try:
                 info = self.plugin.rpc.getinfo()
@@ -194,1573 +609,636 @@ class EVRebalancer:
         return self._our_node_id
     
     def set_profitability_analyzer(self, analyzer: 'ChannelProfitabilityAnalyzer') -> None:
-        """Set the profitability analyzer instance."""
         self._profitability_analyzer = analyzer
     
     def find_rebalance_candidates(self) -> List[RebalanceCandidate]:
         """
-        Find channels that are profitable to rebalance.
+        Find channels that would benefit from rebalancing.
         
-        This is the main entry point, called periodically by the timer.
-        
-        Returns:
-            List of RebalanceCandidate objects for profitable moves
+        This method:
+        1. First monitors existing jobs to clean up finished ones
+        2. Filters out channels with active jobs
+        3. Respects max concurrent job limit
+        4. Returns prioritized list of candidates
         """
         candidates = []
         
-        # GLOBAL CAPITAL CONTROLS: Check wallet reserve and daily budget
+        # First, monitor existing jobs and clean up finished ones
+        if self.job_manager.active_job_count > 0:
+            monitor_result = self.job_manager.monitor_jobs()
+            self.plugin.log(
+                f"Job monitor: {monitor_result['checked']} checked, "
+                f"{monitor_result['completed']} completed, "
+                f"{monitor_result['failed']} failed, "
+                f"{monitor_result['timed_out']} timed out, "
+                f"{monitor_result['still_running']} running"
+            )
+        
+        # Check if we have slots available
+        available_slots = self.job_manager.slots_available()
+        if available_slots <= 0:
+            self.plugin.log(
+                f"No rebalance slots available ({self.job_manager.active_job_count}/"
+                f"{self.job_manager.max_concurrent_jobs} jobs active)"
+            )
+            return candidates
+        
+        # Check capital controls
         if not self._check_capital_controls():
             return candidates
         
-        # Get current channel states
         channels = self._get_channels_with_balances()
-        
         if not channels:
-            self.plugin.log("No channels available for rebalance analysis")
             return candidates
         
-        # Find channels low on outbound (need rebalancing)
+        # Get set of channels with active jobs
+        active_channels = set(self.job_manager.active_channels)
+        
         depleted_channels = []
         source_channels = []
         
         for channel_id, info in channels.items():
             capacity = info.get("capacity", 0)
             spendable = info.get("spendable_sats", 0)
-            
-            if capacity == 0:
+            if capacity == 0: 
                 continue
             
             outbound_ratio = spendable / capacity
             
-            if outbound_ratio < self.config.low_liquidity_threshold:
-                # This channel needs liquidity
-                depleted_channels.append((channel_id, info, outbound_ratio))
-            elif outbound_ratio > self.config.high_liquidity_threshold:
-                # This channel has excess liquidity
-                source_channels.append((channel_id, info, outbound_ratio))
-        
-        if not depleted_channels:
-            self.plugin.log("No channels need rebalancing")
-            return candidates
-        
-        if not source_channels:
-            self.plugin.log("No source channels available for rebalancing")
-            return candidates
-        
-        self.plugin.log(
-            f"Found {len(depleted_channels)} depleted and "
-            f"{len(source_channels)} source channels"
-        )
-        
-        # Analyze each depleted channel for rebalance EV
-        for dest_id, dest_info, dest_ratio in depleted_channels:
-            # ADAPTIVE FAILURE BACKOFF (Task 3)
-            # Use exponential backoff for channels that keep failing
-            # This prevents wasting resources on "stuck" channels
-            if self._is_pending_with_backoff(dest_id):
+            # Skip channels with active jobs
+            normalized = channel_id.replace(':', 'x')
+            if normalized in active_channels:
                 continue
             
-            # Skip if within cooldown period from DB (successful rebalance cooldown)
+            if outbound_ratio < self.config.low_liquidity_threshold:
+                depleted_channels.append((channel_id, info, outbound_ratio))
+            elif outbound_ratio > self.config.high_liquidity_threshold:
+                source_channels.append((channel_id, info, outbound_ratio))
+        
+        if not depleted_channels or not source_channels:
+            return candidates
+            
+        self.plugin.log(
+            f"Found {len(depleted_channels)} depleted and {len(source_channels)} source channels "
+            f"(excluding {len(active_channels)} with active jobs)"
+        )
+        
+        for dest_id, dest_info, dest_ratio in depleted_channels:
+            if self._is_pending_with_backoff(dest_id): 
+                continue
+            
             last_rebalance = self.database.get_last_rebalance_time(dest_id)
             if last_rebalance:
-                cooldown_seconds = self.config.rebalance_cooldown_hours * 3600
-                time_since_last = int(time.time()) - last_rebalance
-                if time_since_last < cooldown_seconds:
-                    hours_remaining = (cooldown_seconds - time_since_last) / 3600
-                    self.plugin.log(
-                        f"Skipping {dest_id}: within {self.config.rebalance_cooldown_hours}h "
-                        f"cooldown ({hours_remaining:.1f}h remaining)"
-                    )
+                cooldown = self.config.rebalance_cooldown_hours * 3600
+                if int(time.time()) - last_rebalance < cooldown: 
                     continue
             
-            candidate = self._analyze_rebalance_ev(
-                dest_id, dest_info, dest_ratio, source_channels
-            )
-            
+            candidate = self._analyze_rebalance_ev(dest_id, dest_info, dest_ratio, source_channels)
             if candidate:
                 candidates.append(candidate)
+                
+                # Stop if we have enough candidates to fill available slots
+                if len(candidates) >= available_slots:
+                    break
         
-        # Sort by priority: SOURCE channels first (they're money printers!), then by profit
-        # SOURCE channels get a priority boost since keeping them full is critical
+        # Sort by priority
         def sort_key(c):
             dest_state = self.database.get_channel_state(c.to_channel)
             flow_state = dest_state.get("state", "balanced") if dest_state else "balanced"
-            # SOURCE = 2 (highest priority), BALANCED = 1, SINK should never appear here
             priority = 2 if flow_state == "source" else 1
             return (priority, c.expected_profit_sats)
         
         candidates.sort(key=sort_key, reverse=True)
         
-        return candidates
-    
+        # Limit to available slots
+        return candidates[:available_slots]
+
     def _analyze_rebalance_ev(self, dest_channel: str, dest_info: Dict[str, Any],
                               dest_ratio: float,
-                              sources: List[Tuple[str, Dict[str, Any], float]]
-                              ) -> Optional[RebalanceCandidate]:
-        """
-        Analyze the expected value of rebalancing to a depleted channel.
-        
-        EV Calculation Steps:
-        1. Check flow state - ABORT if channel is a SINK
-        2. Determine rebalance amount (how much to move)
-        3. Get our outbound fee on the destination channel
-        4. Estimate inbound routing cost
-        5. Calculate spread and max budget
-        6. Check if profitable
-        
-        CRITICAL FLOW STATE LOGIC:
-        - SINK channels fill themselves for free via routing
-        - Paying to rebalance into a SINK is throwing money away
-        - SOURCE channels are money printers - prioritize them
-        
-        Args:
-            dest_channel: Channel needing liquidity
-            dest_info: Channel information
-            dest_ratio: Current outbound ratio
-            sources: List of source channels to choose from
-            
-        Returns:
-            RebalanceCandidate if profitable, None otherwise
-        """
-        # CRITICAL: Check flow state FIRST
-        # Don't rebalance into SINK channels - they fill themselves for free!
+                              sources: List[Tuple[str, Dict[str, Any], float]]) -> Optional[RebalanceCandidate]:
+        """Analyze expected value of rebalancing a channel."""
         dest_state = self.database.get_channel_state(dest_channel)
         dest_flow_state = dest_state.get("state", "unknown") if dest_state else "unknown"
         
-        if dest_flow_state == "sink":
-            self.plugin.log(
-                f"Skipping {dest_channel}: SINK channel fills itself for free. "
-                f"Do NOT pay fees to rebalance into it!"
-            )
+        if dest_flow_state == "sink": 
             return None
         
-        # HTLC SLOT CONGESTION CHECK
-        # Don't pay fees to move liquidity into a channel that cannot route new
-        # payments due to HTLC slot exhaustion. Check both state and live data.
-        if dest_flow_state == "congested":
-            # Get HTLC counts from dest_info if available for logging
-            active_htlcs = dest_info.get("active_htlcs", "?")
-            max_htlcs = dest_info.get("max_htlcs", "?")
-            self.plugin.log(
-                f"Skipping rebalance: Channel {dest_channel} is slot-congested "
-                f"({active_htlcs}/{max_htlcs}). Cannot route new payments."
-            )
-            return None
-        
-        # Also check live HTLC data from dest_info (in case state is stale)
-        active_htlcs = dest_info.get("active_htlcs", 0)
-        max_htlcs = dest_info.get("max_htlcs", 483)
-        if max_htlcs > 0 and active_htlcs / max_htlcs > self.config.htlc_congestion_threshold:
-            self.plugin.log(
-                f"Skipping rebalance: Channel {dest_channel} is slot-congested "
-                f"({active_htlcs}/{max_htlcs}). Cannot route new payments."
-            )
-            return None
-        
-        # Check channel profitability if analyzer is available
-        # Skip or deprioritize underwater/zombie channels based on MARGINAL ROI
-        channel_profitability = None
+        # Check profitability logic
         if self._profitability_analyzer:
             try:
-                channel_profitability = self._profitability_analyzer.analyze_channel(dest_channel)
-                if channel_profitability:
-                    profitability_class = channel_profitability.classification.value
-                    
-                    # ZOMBIE channels: No routing activity for 30+ days - don't invest more
-                    if profitability_class == "zombie":
-                        self.plugin.log(
-                            f"Skipping {dest_channel}: ZOMBIE channel has no routing activity. "
-                            f"Don't invest more until it shows life."
-                        )
-                        return None
-                    
-                    # UNDERWATER channels: Negative Total ROI - check MARGINAL ROI
-                    # Total ROI includes sunk on-chain opening costs, which can make
-                    # new/empty channels appear unprofitable even if they would cover
-                    # their rebalancing costs. This is the "Liquidity Trap".
-                    #
-                    # Solution: Evaluate Marginal ROI (Operational Profitability)
-                    # - If marginal_roi > 0: Channel covers its rebalancing costs - ALLOW
-                    # - If marginal_roi <= 0: Channel loses money on every operation - SKIP
-                    if profitability_class == "underwater":
-                        marginal_roi = channel_profitability.marginal_roi
-                        marginal_roi_pct = channel_profitability.marginal_roi_percent
-                        total_roi_pct = channel_profitability.roi_percent
-                        
-                        if marginal_roi > 0:
-                            # Channel is operationally profitable - covers rebalancing costs
-                            # The negative Total ROI is just sunk cost (opening fees)
-                            self.plugin.log(
-                                f"Channel {dest_channel} is UNDERWATER (Total ROI={total_roi_pct:.1f}%) "
-                                f"but OPERATIONALLY PROFITABLE (Marginal ROI={marginal_roi_pct:.1f}%). "
-                                f"Allowing rebalance - channel covers its costs."
-                            )
-                            # Continue with rebalance - don't return None
-                        else:
-                            # Channel loses money on every operation - skip it
-                            self.plugin.log(
-                                f"Skipping {dest_channel}: UNDERWATER channel with NEGATIVE marginal ROI "
-                                f"(Total ROI={total_roi_pct:.1f}%, Marginal ROI={marginal_roi_pct:.1f}%). "
-                                f"Channel loses money on every operation. Fix economics first."
-                            )
-                            return None
-            except Exception as e:
-                self.plugin.log(f"Error checking profitability for {dest_channel}: {e}")
-        
-        # Determine how much to rebalance
+                prof = self._profitability_analyzer.analyze_channel(dest_channel)
+                if prof and prof.classification.value == "zombie": 
+                    return None
+                if prof and prof.classification.value == "underwater" and prof.marginal_roi <= 0:
+                    return None
+            except Exception: 
+                pass
+
         capacity = dest_info.get("capacity", 0)
         spendable = dest_info.get("spendable_sats", 0)
         
-        # DYNAMIC LIQUIDITY TARGETING (Task 1)
-        # The old approach targeted 50% for all channels - the "Balance Fallacy".
-        # Different channel types need different target balances:
-        #
-        # SOURCE (Draining): Target 85% Outbound
-        #   - These channels drain quickly via routing
-        #   - Keep them full so they can keep earning
-        #   - We WANT outbound liquidity here
-        #
-        # BALANCED: Target 50% Outbound
-        #   - Standard equilibrium target
-        #   - Let natural flow determine direction
-        #
-        # SINK (Filling): Target 15% Outbound
-        #   - These channels fill themselves for free via routing
-        #   - Only rebalance if critically low
-        #   - Waste of fees to fill what will fill naturally
-        #
-        # Note: We already skip pure SINK channels above, but this handles
-        # channels that are "slightly sink" or transitioning states.
-        
-        if dest_flow_state == "source":
-            # SOURCE channels are money printers - keep them full (85% outbound)
+        # Dynamic targeting
+        if dest_flow_state == "source": 
             target_ratio = 0.85
-            target_spendable = int(capacity * target_ratio)
-            self.plugin.log(
-                f"Channel {dest_channel[:12]}... is SOURCE: targeting {target_ratio:.0%} outbound",
-                level='debug'
-            )
-        elif dest_flow_state == "sink":
-            # SINK channels fill naturally - only rebalance if critical (15% outbound)
-            # Note: Pure sinks are already skipped above, this is for edge cases
+        elif dest_flow_state == "sink": 
             target_ratio = 0.15
-            target_spendable = int(capacity * target_ratio)
-            self.plugin.log(
-                f"Channel {dest_channel[:12]}... is SINK: targeting only {target_ratio:.0%} outbound",
-                level='debug'
-            )
-        else:
-            # BALANCED or UNKNOWN - use standard 50% target
+        else: 
             target_ratio = 0.50
-            target_spendable = capacity // 2
         
+        target_spendable = int(capacity * target_ratio)
         amount_needed = target_spendable - spendable
-        
-        # If we're already above target, no need to rebalance
-        if amount_needed <= 0:
-            self.plugin.log(
-                f"Skipping {dest_channel}: already at or above target "
-                f"({spendable} >= {target_spendable} sats, target={target_ratio:.0%})",
-                level='debug'
-            )
+        if amount_needed <= 0: 
             return None
         
-        # Clamp to configured limits
-        rebalance_amount = max(
-            self.config.rebalance_min_amount,
-            min(self.config.rebalance_max_amount, amount_needed)
-        )
-        
-        # Convert to msat for RPC calls
+        rebalance_amount = max(self.config.rebalance_min_amount, 
+                             min(self.config.rebalance_max_amount, amount_needed))
         amount_msat = rebalance_amount * 1000
         
-        # Get our outbound fee on destination channel
         outbound_fee_ppm = dest_info.get("fee_ppm", 0)
-        
-        # Estimate inbound routing cost
-        # This is the fee we'll pay to route sats to ourselves
         inbound_fee_ppm = self._estimate_inbound_fee(dest_info.get("peer_id", ""))
         
-        # Find best source channel FIRST (we need source fee for opportunity cost)
         best_source = self._select_source_channel(sources, rebalance_amount, dest_channel)
-        if not best_source:
+        if not best_source: 
             return None
-        
         source_id, source_info = best_source
         
-        # Get source channel fee (OPPORTUNITY COST)
-        # By draining the source channel, we lose potential routing income
         source_fee_ppm = source_info.get("fee_ppm", 0)
-        
-        # Calculate source turnover rate FIRST (needed for weighted opportunity cost)
         source_capacity = source_info.get("capacity", 1)
         source_turnover_rate = self._calculate_turnover_rate(source_id, source_capacity)
         
-        # WEIGHTED OPPORTUNITY COST (Task 3A)
-        # The full source fee assumes 100% probability the liquidity would have been used.
-        # This is too aggressive for low-volume channels. Weight by actual turnover.
-        # 
-        # weighted_opp_cost = source_fee_ppm * min(1.0, source_turnover_rate * 7)
-        # 
-        # Example:
-        # - High turnover (20%/day * 7 = 140% -> capped at 100%): Full opportunity cost
-        # - Low turnover (2%/day * 7 = 14%): Only 14% of source fee counts as opp cost
-        #
-        # This prevents over-penalizing low-volume source channels that might never
-        # route anyway, while still accounting for opportunity cost on active channels.
-        turnover_weight = min(1.0, source_turnover_rate * 7)  # 7-day projection
+        turnover_weight = min(1.0, source_turnover_rate * 7)
         weighted_opp_cost = int(source_fee_ppm * turnover_weight)
-        
-        # Calculate spread INCLUDING WEIGHTED opportunity cost
-        # Old: spread = dest_fee - inbound_cost - full_source_fee
-        # New: spread = dest_fee - inbound_cost - weighted_opp_cost
         spread_ppm = outbound_fee_ppm - inbound_fee_ppm - weighted_opp_cost
         
-        # SANITY CHECK (Task 3B): Don't drain high-fee, active channels for low-fee destinations
-        # If the source channel earns MORE than the destination AND is active (>10% turnover),
-        # we should NOT drain it even if the spread math technically works.
-        # This prevents draining your best channels to feed mediocre ones.
-        if outbound_fee_ppm < source_fee_ppm and source_turnover_rate > 0.10:
-            self.plugin.log(
-                f"Skipping {dest_channel}: SANITY CHECK failed - "
-                f"source channel earns MORE ({source_fee_ppm}ppm) than dest ({outbound_fee_ppm}ppm) "
-                f"AND is highly active ({source_turnover_rate:.1%} daily turnover). "
-                f"Don't drain a money-printing channel to fill a lower-fee one!"
-            )
+        if spread_ppm <= 0: 
             return None
         
-        # CRITICAL: Check spread FIRST before any calculations
-        # If spread is negative, we LOSE money on every rebalance!
-        if spread_ppm <= 0:
-            self.plugin.log(
-                f"Skipping {dest_channel}: negative/zero spread after weighted opportunity cost "
-                f"(dest={outbound_fee_ppm}ppm - rebal={inbound_fee_ppm}ppm - "
-                f"weighted_opp={weighted_opp_cost}ppm [raw={source_fee_ppm}ppm * {turnover_weight:.0%}] = {spread_ppm}ppm)"
-            )
-            return None
-        
-        # Calculate max budget (what we can pay and still profit)
-        # max_budget = spread * amount / 1_000_000
         max_budget_sats = (spread_ppm * rebalance_amount) // 1_000_000
         max_budget_msat = max_budget_sats * 1000
         
-        # KELLY CRITERION POSITION SIZING (Phase 4: Risk Management)
-        # Scale budget based on "Probability of Win" derived from peer reputation.
-        # This prevents betting full budget on unreliable peers.
-        #
-        # Kelly Formula: f = p - (1-p)/b
-        # where:
-        #   p = probability of success (peer reputation score)
-        #   b = odds (potential profit / cost of rebalance)
-        #   f = fraction of bankroll to bet
-        #
-        # We use "Half Kelly" (or user-configured fraction) to reduce volatility drag.
+        # Kelly logic
         if self.config.enable_kelly:
-            dest_peer_id = dest_info.get("peer_id", "")
-            reputation = self.database.get_peer_reputation(dest_peer_id)
-            p = reputation.get('score', 0.5)  # Laplace-smoothed success rate
-            
-            # Calculate odds (b = potential profit / cost)
-            # Potential profit = outbound_fee_ppm (what we earn per routing)
-            # Cost = inbound_fee_ppm + weighted_opp_cost (what we pay to rebalance)
+            reputation = self.database.get_peer_reputation(dest_info.get("peer_id", ""))
+            p = reputation.get('score', 0.5)
             cost_ppm = inbound_fee_ppm + weighted_opp_cost
+            b = outbound_fee_ppm / cost_ppm if cost_ppm > 0 else float('inf')
+            kelly_f = p - (1 - p) / b if b > 0 else -1.0
+            kelly_safe = min(kelly_f * self.config.kelly_fraction, 1.0)
             
-            # Division-by-zero protection
-            if cost_ppm > 0:
-                b = outbound_fee_ppm / cost_ppm
-            else:
-                b = float('inf')  # Free rebalance, infinite odds
-            
-            # Kelly fraction: f = p - (1-p)/b
-            # Protect against division by zero when b is very small
-            if b > 0:
-                kelly_f = p - (1 - p) / b
-            else:
-                kelly_f = -1.0  # Negative Kelly (don't bet)
-            
-            # Apply configured multiplier (Half Kelly by default)
-            kelly_safe = kelly_f * self.config.kelly_fraction
-            
-            # If Kelly fraction is zero or negative, the risk is too high - skip rebalance
-            if kelly_safe <= 0:
-                self.plugin.log(
-                    f"Skipping {dest_channel}: Kelly Criterion REJECT - "
-                    f"p={p:.2f}, b={b:.2f} -> f={kelly_f:.3f}, f_safe={kelly_safe:.3f}. "
-                    f"Risk too high for peer with reputation score {p:.2f}."
-                )
+            if kelly_safe <= 0: 
                 return None
-            
-            # Scale the budget by Kelly fraction (cap at 1.0 to never exceed original budget)
-            kelly_safe = min(kelly_safe, 1.0)
-            original_budget = max_budget_sats
             max_budget_sats = int(max_budget_sats * kelly_safe)
             max_budget_msat = max_budget_sats * 1000
-            
-            self.plugin.log(
-                f"Kelly Sizing: p={p:.2f}, b={b:.2f} -> f={kelly_f:.3f}. "
-                f"Scaling budget by {kelly_safe:.2%} ({original_budget} -> {max_budget_sats} sats)."
-            )
 
-        # Calculate max fee as PPM for circular
-        # This is the KEY constraint we pass to circular
-        # Note: We use inbound_fee_ppm here since that's what we're actually paying
-        # The spread already accounts for opportunity cost in expected profit
         if amount_msat > 0:
-            # Effective max fee = spread + inbound (since we want to pay at most what
-            # makes us break even after opportunity cost)
-            effective_max_fee_ppm = inbound_fee_ppm + (spread_ppm // 2)  # Leave margin
+            effective_max_fee_ppm = inbound_fee_ppm + (spread_ppm // 2)
             max_fee_ppm = max(1, min(effective_max_fee_ppm, spread_ppm + inbound_fee_ppm))
         else:
             max_fee_ppm = 0
-        
-        # Check if max_fee_ppm is reasonable
-        if max_fee_ppm <= 0:
-            self.plugin.log(
-                f"Skipping {dest_channel}: max_fee_ppm is zero or negative"
-            )
+            
+        if max_fee_ppm <= 0: 
             return None
         
-        # Dynamic utilization based on actual channel turnover
         dest_turnover_rate = self._calculate_turnover_rate(dest_channel, capacity)
-        # Note: source_turnover_rate was already calculated above for weighted opportunity cost
-        
-        # Project expected routing based on actual turnover, scaled by cooldown period
-        # If channel turns over 5% daily and cooldown is 24h, expect ~5% utilization
         cooldown_days = self.config.rebalance_cooldown_hours / 24.0
-        expected_utilization = min(dest_turnover_rate * cooldown_days, 1.0)  # Cap at 100%
+        expected_utilization = max(min(dest_turnover_rate * cooldown_days, 1.0), 0.05)
         
-        # Ensure minimum utilization estimate if no history
-        expected_utilization = max(expected_utilization, 0.05)  # At least 5%
+        expected_income = (rebalance_amount * expected_utilization * outbound_fee_ppm) // 1_000_000
+        expected_source_loss = (rebalance_amount * expected_utilization * source_fee_ppm * turnover_weight) // 1_000_000
+        expected_profit = expected_income - max_budget_sats - expected_source_loss
         
-        expected_routing = rebalance_amount * expected_utilization
-        expected_fee_income = (expected_routing * outbound_fee_ppm) // 1_000_000
-        
-        # Calculate WEIGHTED opportunity cost for expected profit calculation
-        # Use the same weighted approach as the spread calculation
-        expected_source_utilization = min(source_turnover_rate * cooldown_days, 1.0)
-        expected_source_utilization = max(expected_source_utilization, 0.05)
-        expected_source_routing = rebalance_amount * expected_source_utilization
-        expected_source_loss = (expected_source_routing * source_fee_ppm * turnover_weight) // 1_000_000
-        
-        # Estimated profit = expected income - max budget - weighted opportunity cost
-        expected_profit = expected_fee_income - max_budget_sats - expected_source_loss
-        
-        # CRITICAL: Check if expected profit meets minimum threshold
-        # This is the EV check - only rebalance if we expect to profit
-        if expected_profit < self.config.rebalance_min_profit:
-            self.plugin.log(
-                f"Skipping {dest_channel}: not profitable enough with weighted opportunity cost "
-                f"(profit={expected_profit}sats < min={self.config.rebalance_min_profit}sats, "
-                f"fee_income={expected_fee_income}sats, rebal_cost={max_budget_sats}sats, "
-                f"weighted_opp_cost={expected_source_loss}sats [weight={turnover_weight:.0%}], "
-                f"dest_turnover={dest_turnover_rate:.2%}, src_turnover={source_turnover_rate:.2%})"
-            )
+        if expected_profit < self.config.rebalance_min_profit: 
             return None
-        
-        # Log priority for SOURCE channels
-        if dest_flow_state == "source":
-            self.plugin.log(
-                f"HIGH PRIORITY: {dest_channel} is a SOURCE (money printer). "
-                f"NetSpread={spread_ppm}ppm (dest={outbound_fee_ppm}ppm, "
-                f"rebal={inbound_fee_ppm}ppm, weighted_opp={weighted_opp_cost}ppm [raw={source_fee_ppm}ppm * {turnover_weight:.0%}]), "
-                f"dest_turnover={dest_turnover_rate:.2%}, src_turnover={source_turnover_rate:.2%}"
-            )
         
         return RebalanceCandidate(
-            from_channel=source_id,
-            to_channel=dest_channel,
-            from_peer_id=source_info.get("peer_id", ""),
-            to_peer_id=dest_info.get("peer_id", ""),
-            amount_sats=rebalance_amount,
-            amount_msat=amount_msat,
-            outbound_fee_ppm=outbound_fee_ppm,
-            inbound_fee_ppm=inbound_fee_ppm,
-            source_fee_ppm=source_fee_ppm,
-            weighted_opp_cost_ppm=weighted_opp_cost,
-            spread_ppm=spread_ppm,
-            max_budget_sats=max_budget_sats,
-            max_budget_msat=max_budget_msat,
-            max_fee_ppm=max_fee_ppm,
-            expected_profit_sats=expected_profit,
-            liquidity_ratio=dest_ratio,
-            dest_flow_state=dest_flow_state,
-            dest_turnover_rate=dest_turnover_rate,
+            from_channel=source_id, to_channel=dest_channel,
+            from_peer_id=source_info.get("peer_id", ""), to_peer_id=dest_info.get("peer_id", ""),
+            amount_sats=rebalance_amount, amount_msat=amount_msat,
+            outbound_fee_ppm=outbound_fee_ppm, inbound_fee_ppm=inbound_fee_ppm,
+            source_fee_ppm=source_fee_ppm, weighted_opp_cost_ppm=weighted_opp_cost,
+            spread_ppm=spread_ppm, max_budget_sats=max_budget_sats,
+            max_budget_msat=max_budget_msat, max_fee_ppm=max_fee_ppm,
+            expected_profit_sats=expected_profit, liquidity_ratio=dest_ratio,
+            dest_flow_state=dest_flow_state, dest_turnover_rate=dest_turnover_rate,
             source_turnover_rate=source_turnover_rate
         )
-    
+
     def _calculate_turnover_rate(self, channel_id: str, capacity: int) -> float:
-        """
-        Calculate the daily turnover rate for a channel.
-        
-        Turnover Rate = Daily Volume / Capacity
-        
-        This tells us how much of the channel's capacity is utilized per day.
-        A channel with 1M capacity and 100k daily volume has 10% turnover.
-        
-        Args:
-            channel_id: Channel to calculate turnover for
-            capacity: Channel capacity in sats
-            
-        Returns:
-            Turnover rate as decimal (e.g., 0.10 = 10% daily turnover)
-        """
-        if capacity <= 0:
+        if capacity <= 0: 
             return 0.0
-        
         try:
-            # Get daily volume from channel state
             state = self.database.get_channel_state(channel_id)
-            if not state:
-                return 0.05  # Default 5% if no data
-            
-            # Calculate daily volume (sats_in + sats_out over flow_window_days)
-            total_volume = state.get("sats_in", 0) + state.get("sats_out", 0)
-            flow_window = max(self.config.flow_window_days, 1)
-            daily_volume = total_volume / flow_window
-            
-            # Calculate turnover rate
-            turnover_rate = daily_volume / capacity
-            
-            # Sanity bounds (0.01% to 100% daily turnover)
-            turnover_rate = max(0.0001, min(1.0, turnover_rate))
-            
-            return turnover_rate
-            
-        except Exception as e:
-            self.plugin.log(f"Error calculating turnover for {channel_id}: {e}", level='debug')
-            return 0.05  # Default 5% on error
-    
+            if not state: 
+                return 0.05
+            volume = (state.get("sats_in", 0) + state.get("sats_out", 0)) / max(self.config.flow_window_days, 1)
+            return max(0.0001, min(1.0, volume / capacity))
+        except Exception: 
+            return 0.05
+
     def _estimate_inbound_fee(self, peer_id: str, amount_msat: int = 100000000) -> int:
-        """
-        Estimate the fee we'll pay to route to ourselves via a peer.
+        last_hop = self._get_last_hop_fee(peer_id)
+        if last_hop is not None:
+            return last_hop + self.config.inbound_fee_estimate_ppm
         
-        REWRITTEN (Task 2): Last Hop Cost + Network Buffer
+        hist_fee = self._get_historical_inbound_fee(peer_id)
+        if hist_fee: 
+            return hist_fee
         
-        The previous implementation was too generic and often underestimated costs.
-        The new approach explicitly looks at the peer's fee policy towards us
-        (the "last hop" cost) and adds a buffer for the rest of the network path.
-        
-        Priority Order:
-        1. Last Hop Cost: Peer's explicit fee to route TO US (from listchannels)
-           + Network buffer for hops 1 to N-1
-        2. Historical data: What we've actually paid before
-        3. getroute probe: Network fees (may not reflect actual circular path)
-        4. Fallback default: Conservative estimate
-        
-        Args:
-            peer_id: The peer we're routing through
-            amount_msat: Amount to estimate fees for (default 100k sats)
-            
-        Returns:
-            Estimated inbound fee in PPM
-        """
-        # Method 1 (PRIORITY): Get the LAST HOP COST explicitly
-        # This is the fee the peer charges to route TO US
-        # It's the most important component and was previously underweighted
-        last_hop_fee = self._get_last_hop_fee(peer_id)
-        if last_hop_fee is not None:
-            # Add network buffer for hops 1 to N-1
-            # The last hop is the peer -> us, but we also need to pay
-            # for the network path from us -> ... -> peer
-            network_buffer = self.config.inbound_fee_estimate_ppm
-            total_estimate = last_hop_fee + network_buffer
-            
-            self.plugin.log(
-                f"Inbound fee estimate for {peer_id[:12]}...: {total_estimate} PPM "
-                f"(last_hop={last_hop_fee}ppm + network_buffer={network_buffer}ppm)",
-                level='debug'
-            )
-            return total_estimate
-        
-        # Method 2: Check historical rebalance costs from database
-        historical_fee = self._get_historical_inbound_fee(peer_id)
-        if historical_fee is not None:
-            return historical_fee
-        
-        # Method 3: Use getroute to probe actual network fees
-        # Note: This may not reflect actual circular path costs accurately
         route_fee = self._get_route_fee_estimate(peer_id, amount_msat)
-        if route_fee is not None:
+        if route_fee: 
             return route_fee
         
-        # Method 4: Fallback default
-        self.plugin.log(
-            f"Using default inbound fee estimate for peer {peer_id[:12]}...",
-            level='debug'
-        )
-        return 1000  # Conservative default (1000 ppm)
-    
+        return 1000
+
     def _get_last_hop_fee(self, peer_id: str) -> Optional[int]:
-        """
-        Get the peer's fee to route TO US (the "last hop" cost).
-        
-        This queries listchannels for channels from the peer to us,
-        and extracts the fee_per_millionth they charge.
-        
-        This is the most accurate component of inbound fee estimation
-        because it's the explicit fee policy for the final hop.
-        
-        Args:
-            peer_id: Peer node ID
-            
-        Returns:
-            Peer's fee to us in PPM, or None if not found/not public
-        """
         try:
-            our_node_id = self._get_our_node_id()
-            if not our_node_id:
+            our_id = self._get_our_node_id()
+            if not our_id: 
                 return None
-            
-            # Query channels FROM peer (peer as source)
             channels = self.plugin.rpc.listchannels(source=peer_id)
-            
-            for channel in channels.get("channels", []):
-                # Find the channel where destination is US
-                if channel.get("destination") == our_node_id:
-                    fee_ppm = channel.get("fee_per_millionth", 0)
-                    fee_base_msat = channel.get("base_fee_millisatoshi", 0)
-                    
-                    # For better accuracy with base fee:
-                    # Effective PPM = fee_ppm + (base_fee_msat * 1000 / amount_msat)
-                    # But for simplicity and since amounts vary, we use fee_ppm
-                    # plus a small adjustment for base fee
-                    if fee_base_msat > 0:
-                        # Add ~1 ppm per 1 msat base fee (rough adjustment)
-                        fee_ppm += fee_base_msat // 1000
-                    
-                    self.plugin.log(
-                        f"Last hop fee from {peer_id[:12]}... to us: {fee_ppm} PPM "
-                        f"(base={fee_base_msat}msat)",
-                        level='debug'
-                    )
-                    return fee_ppm
-            
-            # Channel not found - might be private or not announced
-            self.plugin.log(
-                f"No public channel from {peer_id[:12]}... to us found in gossip",
-                level='debug'
-            )
-            return None
-                    
-        except Exception as e:
-            self.plugin.log(
-                f"Error getting last hop fee for {peer_id[:12]}...: {e}",
-                level='debug'
-            )
-        
+            for ch in channels.get("channels", []):
+                if ch.get("destination") == our_id:
+                    return ch.get("fee_per_millionth", 0) + (ch.get("base_fee_millisatoshi", 0) // 1000)
+        except Exception: 
+            pass
         return None
-    
+
     def _get_route_fee_estimate(self, peer_id: str, amount_msat: int) -> Optional[int]:
-        """
-        Use getroute to probe actual network fees to reach a peer.
-        
-        This gives us the real routing cost through the network.
-        We route TO the peer (not ourselves) since that's where we need
-        to push liquidity from.
-        
-        Args:
-            peer_id: Target peer node ID
-            amount_msat: Amount to route
-            
-        Returns:
-            Fee in PPM, or None if route not found
-        """
         try:
-            # Get route to the peer
-            # Use a reasonable risk factor and max hops
-            route = self.plugin.rpc.getroute(
-                id=peer_id,
-                amount_msat=amount_msat,
-                riskfactor=10,
-                maxhops=6
-            )
-            
-            route_hops = route.get("route", [])
-            if not route_hops:
-                return None
-            
-            # Calculate total fees from route
-            total_fee_msat = 0
-            for hop in route_hops:
-                # Each hop has the amount at that point
-                # The difference from our send amount is the cumulative fee
-                pass
-            
-            # Simpler: first hop amount - final amount = total fee
-            if len(route_hops) >= 1:
-                first_hop_msat = route_hops[0].get("amount_msat", amount_msat)
-                if isinstance(first_hop_msat, str):
-                    first_hop_msat = int(first_hop_msat.replace("msat", ""))
-                
-                total_fee_msat = first_hop_msat - amount_msat
-                
-                # Convert to PPM
-                if amount_msat > 0:
-                    fee_ppm = int((total_fee_msat / amount_msat) * 1_000_000)
-                    
-                    self.plugin.log(
-                        f"Route probe to {peer_id[:12]}...: {fee_ppm} PPM "
-                        f"({total_fee_msat // 1000} sats for {amount_msat // 1000} sats, "
-                        f"{len(route_hops)} hops)",
-                        level='debug'
-                    )
-                    return fee_ppm
-                    
-        except Exception as e:
-            self.plugin.log(
-                f"getroute probe failed for {peer_id[:12]}...: {e}",
-                level='debug'
-            )
-        
+            route = self.plugin.rpc.getroute(id=peer_id, amount_msat=amount_msat, riskfactor=10, maxhops=6)
+            if route.get("route"):
+                first_hop = route["route"][0].get("amount_msat", amount_msat)
+                if isinstance(first_hop, str): 
+                    first_hop = int(first_hop.replace("msat", ""))
+                return int(((first_hop - amount_msat) / amount_msat) * 1_000_000)
+        except Exception: 
+            pass
         return None
-    
+
     def _get_historical_inbound_fee(self, peer_id: str) -> Optional[int]:
-        """
-        Get average fee from historical successful rebalances to this peer.
-        
-        Args:
-            peer_id: Peer node ID
-            
-        Returns:
-            Average historical fee in PPM, or None if no history
-        """
         try:
-            # Query database for past rebalances to channels with this peer
-            history = self.database.get_rebalance_history_by_peer(peer_id)
-            
-            if not history:
+            hist = self.database.get_rebalance_history_by_peer(peer_id)
+            if not hist: 
                 return None
-            
-            # Calculate average PPM from successful rebalances
-            total_ppm = 0
-            count = 0
-            
-            for record in history:
-                if record.get("status") == "success":
-                    fee_paid = record.get("fee_paid_msat", 0)
-                    amount = record.get("amount_msat", 0)
-                    
-                    if amount > 0:
-                        ppm = int((fee_paid / amount) * 1_000_000)
-                        total_ppm += ppm
-                        count += 1
-            
-            if count > 0:
-                avg_ppm = total_ppm // count
-                self.plugin.log(
-                    f"Historical inbound fee for {peer_id[:12]}...: {avg_ppm} PPM "
-                    f"(from {count} rebalances)",
-                    level='debug'
-                )
-                return avg_ppm
-                
-        except Exception as e:
-            self.plugin.log(
-                f"Error getting historical fees for {peer_id[:12]}...: {e}",
-                level='debug'
-            )
-        
+            total_ppm, count = 0, 0
+            for r in hist:
+                if r.get("status") == "success" and r.get("amount_msat", 0) > 0:
+                    total_ppm += int((r["fee_paid_msat"] / r["amount_msat"]) * 1_000_000)
+                    count += 1
+            if count > 0: 
+                return total_ppm // count
+        except Exception: 
+            pass
         return None
-    
-    def _select_source_channel(self, sources: List[Tuple[str, Dict[str, Any], float]],
-                               amount_needed: int,
-                               dest_channel: Optional[str] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """
-        Select the best source channel for rebalancing.
+
+    def _select_source_channel(self, sources, amount_needed, dest_channel=None):
+        best_source, best_score = None, -float('inf')
+        peers = self._get_peer_connection_status()
         
-        NEW: Now considers opportunity cost when scoring sources.
-        Lower fee sources are preferred because draining them costs us less
-        in opportunity cost.
+        # Also exclude sources with active jobs
+        active_channels = set(self.job_manager.active_channels)
         
-        Criteria:
-        1. Has enough excess liquidity
-        2. Ideally a channel that's filling (sink state) - no opportunity cost!
-        3. LOWEST fees preferred (minimize opportunity cost)
-        4. Peer is connected and reliable
-        
-        Args:
-            sources: List of source channel candidates
-            amount_needed: How much we need to move
-            dest_channel: Optional destination channel (for logging)
-            
-        Returns:
-            (channel_id, channel_info) tuple or None
-        """
-        best_source = None
-        best_score = -float('inf')
-        
-        # Get peer connection status for reliability scoring
-        peer_status = self._get_peer_connection_status()
-        
-        for channel_id, info, outbound_ratio in sources:
-            spendable = info.get("spendable_sats", 0)
-            peer_id = info.get("peer_id", "")
-            
-            # Check if has enough liquidity
-            if spendable < amount_needed:
+        for cid, info, ratio in sources:
+            # Skip if this source has an active job
+            normalized = cid.replace(':', 'x')
+            if normalized in active_channels:
+                continue
+                
+            if info.get("spendable_sats", 0) < amount_needed: 
+                continue
+            pid = info.get("peer_id", "")
+            if pid and pid in peers and not peers[pid].get("connected"): 
                 continue
             
-            # Check if peer is connected - skip disconnected peers
-            if peer_id and peer_id in peer_status:
-                if not peer_status[peer_id].get("connected", False):
-                    self.plugin.log(
-                        f"Skipping source {channel_id}: peer not connected",
-                        level='debug'
-                    )
-                    continue
-            
-            # Calculate score (higher = better source)
-            # CHANGED: Now HEAVILY penalize high-fee sources (opportunity cost)
             fee_ppm = info.get("fee_ppm", 1000)
+            score = (ratio * 50) - (fee_ppm / 10)
             
-            # NEW scoring formula emphasizing LOW opportunity cost:
-            # - Ratio bonus: channels with more excess (up to 50 points)
-            # - Fee PENALTY: high-fee channels are expensive to drain
-            #   (fee_ppm / 10 means 1000ppm = -100 points penalty)
-            score = (outbound_ratio * 50) - (fee_ppm / 10)
-            
-            # BIG Bonus if channel is sink (filling up)
-            # Sinks have essentially ZERO opportunity cost - they refill for free!
-            state = self.database.get_channel_state(channel_id)
-            if state and state.get("state") == "sink":
-                score += 100  # Major bonus - sinks are ideal sources
-                self.plugin.log(
-                    f"Source {channel_id} is SINK (ideal - zero opp cost), fee={fee_ppm}ppm",
-                    level='debug'
-                )
-            elif state and state.get("state") == "balanced":
-                score += 20  # Moderate bonus for balanced channels
-            # SOURCE channels get no bonus - they're earning money, don't drain them!
-            
-            # Bonus for reliable peers (connected with features)
-            if peer_id and peer_id in peer_status:
-                ps = peer_status[peer_id]
-                if ps.get("connected"):
-                    score += 10  # Connected bonus
-                    
-                    # Additional bonus for peers with more channels (established)
-                    num_channels = ps.get("num_channels", 1)
-                    score += min(5, num_channels)  # Up to +5 for multi-channel peers
+            state = self.database.get_channel_state(cid)
+            if state and state.get("state") == "sink": 
+                score += 100
+            elif state and state.get("state") == "balanced": 
+                score += 20
             
             if score > best_score:
                 best_score = score
-                best_source = (channel_id, info)
-        
+                best_source = (cid, info)
         return best_source
-    
-    def _get_peer_connection_status(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Get connection status for all peers.
-        
-        Uses listpeers to check which peers are currently connected
-        and gather reliability metrics.
-        
-        Returns:
-            Dict mapping peer_id to status info
-        """
+
+    def _get_peer_connection_status(self) -> Dict:
         status = {}
-        
         try:
-            result = self.plugin.rpc.listpeers()
+            for p in self.plugin.rpc.listpeers().get("peers", []):
+                status[p.get("id")] = {"connected": p.get("connected", False)}
+        except Exception: 
+            pass
+        return status
+
+    def _get_channels_with_balances(self) -> Dict[str, Dict[str, Any]]:
+        """Get all channels with their current balances and fee info."""
+        channels = {}
+        try:
+            listfunds = self.plugin.rpc.listfunds()
+            listpeers = self.plugin.rpc.listpeers()
             
-            for peer in result.get("peers", []):
-                peer_id = peer.get("id", "")
-                if not peer_id:
+            # Build peer info map
+            peer_info = {}
+            for peer in listpeers.get("peers", []):
+                peer_id = peer.get("id")
+                for ch in peer.get("channels", []):
+                    scid = ch.get("short_channel_id")
+                    if scid and ch.get("state") == "CHANNELD_NORMAL":
+                        peer_info[scid] = {
+                            "peer_id": peer_id,
+                            "fee_ppm": ch.get("fee_proportional_millionths", 0),
+                            "base_fee_msat": ch.get("fee_base_msat", 0),
+                            "htlcs": len(ch.get("htlcs", []))
+                        }
+            
+            # Get balances from listfunds
+            for channel in listfunds.get("channels", []):
+                if channel.get("state") != "CHANNELD_NORMAL":
+                    continue
+                    
+                scid = channel.get("short_channel_id", "")
+                if not scid:
                     continue
                 
-                status[peer_id] = {
-                    "connected": peer.get("connected", False),
-                    "num_channels": len(peer.get("channels", [])),
-                    "features": peer.get("features", "")
+                our_amount_msat = channel.get("our_amount_msat", 0)
+                if isinstance(our_amount_msat, str):
+                    our_amount_msat = int(our_amount_msat.replace("msat", ""))
+                
+                amount_msat = channel.get("amount_msat", 0)
+                if isinstance(amount_msat, str):
+                    amount_msat = int(amount_msat.replace("msat", ""))
+                
+                info = peer_info.get(scid, {})
+                channels[scid] = {
+                    "capacity": amount_msat // 1000,
+                    "spendable_sats": our_amount_msat // 1000,
+                    "peer_id": info.get("peer_id", channel.get("peer_id", "")),
+                    "fee_ppm": info.get("fee_ppm", 0),
+                    "base_fee_msat": info.get("base_fee_msat", 0),
+                    "htlcs": info.get("htlcs", 0)
                 }
                 
         except Exception as e:
-            self.plugin.log(f"Error getting peer status: {e}", level='debug')
+            self.plugin.log(f"Error getting channel balances: {e}", level='error')
         
-        return status
-    
+        return channels
+
     def execute_rebalance(self, candidate: RebalanceCandidate) -> Dict[str, Any]:
         """
-        Execute a rebalance using the configured rebalancer plugin.
+        Execute a rebalance for the given candidate.
         
-        MANAGER-OVERRIDE PATTERN:
-        1. Unmanage both channels from clboss
-        2. Record the rebalance attempt
-        3. Call the rebalancer plugin with strict budget
-        4. Record the result
-        
-        Args:
-            candidate: The RebalanceCandidate to execute
-            
-        Returns:
-            Result dict with success status and details
+        For sling: Starts an async background job
+        For circular: Executes synchronously (legacy behavior)
         """
-        result = {
-            "success": False,
-            "candidate": candidate.to_dict(),
-            "message": ""
-        }
-        
-        # Mark as pending
+        result = {"success": False, "candidate": candidate.to_dict(), "message": ""}
         self._pending[candidate.to_channel] = int(time.time())
         
         try:
-            # Step 1: Unmanage from clboss (both fee AND balance)
-            # This tells clboss: "Don't touch fees AND don't rebalance these channels"
-            # ClbossTags.FEE_AND_BALANCE is "lnfee,balance" as comma-separated string
+            # Ensure channels are unmanaged from clboss
             self.clboss.ensure_unmanaged_for_channel(
-                candidate.from_channel, candidate.from_peer_id,
+                candidate.from_channel, candidate.from_peer_id, 
                 ClbossTags.FEE_AND_BALANCE, self.database
             )
             self.clboss.ensure_unmanaged_for_channel(
-                candidate.to_channel, candidate.to_peer_id,
+                candidate.to_channel, candidate.to_peer_id, 
                 ClbossTags.FEE_AND_BALANCE, self.database
             )
             
-            # Step 2: Record the attempt
+            # Record rebalance attempt in database
             rebalance_id = self.database.record_rebalance(
-                from_channel=candidate.from_channel,
-                to_channel=candidate.to_channel,
-                amount_sats=candidate.amount_sats,
-                max_fee_sats=candidate.max_budget_sats,
-                expected_profit_sats=candidate.expected_profit_sats,
-                status='pending'
+                candidate.from_channel, candidate.to_channel, candidate.amount_sats,
+                candidate.max_budget_sats, candidate.expected_profit_sats, 'pending'
             )
             
-            # Step 3: Execute via rebalancer plugin
             if self.config.dry_run:
-                self.plugin.log(
-                    f"[DRY RUN] Would rebalance {candidate.amount_sats} sats "
-                    f"from {candidate.from_channel} to {candidate.to_channel} "
-                    f"with max fee {candidate.max_budget_sats} sats ({candidate.max_fee_ppm} ppm)"
-                )
-                result["success"] = True
-                result["message"] = "Dry run - no changes made"
+                self.plugin.log(f"[DRY RUN] Would rebalance {candidate.amount_sats} sats "
+                              f"from {candidate.from_channel} to {candidate.to_channel}")
                 self.database.update_rebalance_result(
-                    rebalance_id, 'success',
-                    actual_fee_sats=0,
-                    actual_profit_sats=candidate.expected_profit_sats
+                    rebalance_id, 'success', 0, candidate.expected_profit_sats
                 )
-                return result
-            
-            # Call appropriate rebalancer
-            if self.config.rebalancer_plugin == 'circular':
-                rebalance_result = self._execute_circular(candidate)
-            elif self.config.rebalancer_plugin == 'sling':
-                rebalance_result = self._execute_sling(candidate)
-            else:
-                result["message"] = f"Unknown rebalancer: {self.config.rebalancer_plugin}"
-                self.database.update_rebalance_result(
-                    rebalance_id, 'failed',
-                    error_message=result["message"]
-                )
-                return result
-            
-            # Step 4: Record result and apply anti-thrashing protection
-            if rebalance_result.get("success"):
-                actual_fee = rebalance_result.get("fee_sats", 0)
-                actual_profit = candidate.expected_profit_sats - actual_fee
+                return {"success": True, "message": "Dry run", "rebalance_id": rebalance_id}
+
+            # Route to appropriate rebalancer
+            if self.config.rebalancer_plugin == 'sling':
+                # Async execution via JobManager
+                res = self.job_manager.start_job(candidate, rebalance_id)
                 
-                self.database.update_rebalance_result(
-                    rebalance_id, 'success',
-                    actual_fee_sats=actual_fee,
-                    actual_profit_sats=actual_profit
-                )
-                
-                result["success"] = True
-                result["actual_fee_sats"] = actual_fee
-                result["actual_profit_sats"] = actual_profit
-                result["message"] = "Rebalance completed successfully"
-                
-                # Export metrics on success (Phase 2: Observability)
-                if self.metrics:
-                    labels = {"channel_id": candidate.to_channel}
+                if res.get("success"):
+                    # Update DB status to pending_async
+                    self.database.update_rebalance_result(rebalance_id, 'pending_async')
+                    result.update({
+                        "success": True, 
+                        "message": "Async job started",
+                        "rebalance_id": rebalance_id
+                    })
+                    self.plugin.log(
+                        f"Rebalance job queued: {candidate.to_channel} "
+                        f"(job #{self.job_manager.active_job_count})"
+                    )
+                else:
+                    error = res.get("error", "Failed to start job")
+                    self.database.update_rebalance_result(
+                        rebalance_id, 'failed', error_message=error
+                    )
+                    result["message"] = f"Failed: {error}"
+                    self.plugin.log(f"Failed to start rebalance job: {error}", level='warn')
                     
-                    # Counter: Total rebalancing cost (fees paid)
-                    self.metrics.inc_counter(
-                        MetricNames.REBALANCE_COST_TOTAL_SATS,
-                        actual_fee,
-                        labels,
-                        METRIC_HELP.get(MetricNames.REBALANCE_COST_TOTAL_SATS, "")
-                    )
-                    
-                    # Counter: Total volume moved via rebalancing
-                    self.metrics.inc_counter(
-                        MetricNames.REBALANCE_VOLUME_TOTAL_SATS,
-                        candidate.amount_sats,
-                        labels,
-                        METRIC_HELP.get(MetricNames.REBALANCE_VOLUME_TOTAL_SATS, "")
-                    )
+            elif self.config.rebalancer_plugin == 'circular':
+                # Synchronous execution (legacy)
+                res = self._execute_circular(candidate)
                 
-                # ADAPTIVE BACKOFF: Reset failure count on success (persisted to DB)
-                self.database.reset_failure_count(candidate.to_channel)
-                
-                # ANTI-THRASHING: Keep clboss unmanaged for extended period
-                # This prevents clboss from immediately "fixing" the balance
-                # we just paid fees to establish
-                self.plugin.log(
-                    f"Rebalanced {candidate.amount_sats} sats to {candidate.to_channel}, "
-                    f"fee={actual_fee}, profit={actual_profit}. "
-                    f"Keeping clboss unmanaged to prevent thrashing."
-                )
+                if res.get("success"):
+                    fee = res.get("fee_sats", 0)
+                    self.database.update_rebalance_result(
+                        rebalance_id, 'success', fee, candidate.expected_profit_sats - fee
+                    )
+                    self.database.reset_failure_count(candidate.to_channel)
+                    if self.metrics:
+                        self.metrics.inc_counter(
+                            MetricNames.REBALANCE_COST_TOTAL_SATS, 
+                            fee, 
+                            {"channel_id": candidate.to_channel}
+                        )
+                    result.update({
+                        "success": True, 
+                        "actual_fee_sats": fee, 
+                        "message": "Success",
+                        "rebalance_id": rebalance_id
+                    })
+                    self.plugin.log(
+                        f"Rebalance SUCCESS: {candidate.to_channel} filled. Fee: {fee} sats."
+                    )
+                else:
+                    error = res.get("error", "Unknown error")
+                    self.database.update_rebalance_result(
+                        rebalance_id, 'failed', error_message=error
+                    )
+                    self.database.increment_failure_count(candidate.to_channel)
+                    result["message"] = f"Failed: {error}"
+                    self.plugin.log(f"Rebalance FAILED: {error}", level='warn')
             else:
-                error = rebalance_result.get("error", "Unknown error")
-                self.database.update_rebalance_result(
-                    rebalance_id, 'failed',
-                    error_message=error
-                )
-                result["message"] = f"Rebalance failed: {error}"
-                
-                # Export failure metric (Phase 2: Observability)
-                if self.metrics:
-                    labels = {"channel_id": candidate.to_channel}
-                    self.metrics.inc_counter(
-                        MetricNames.REBALANCE_FAILURES_TOTAL,
-                        1,
-                        labels,
-                        METRIC_HELP.get(MetricNames.REBALANCE_FAILURES_TOTAL, "")
-                    )
-                
-                # ADAPTIVE BACKOFF: Increment failure count (persisted to DB)
-                new_failure_count = self.database.increment_failure_count(candidate.to_channel)
-                
-                # Calculate next backoff time for logging
-                base_cooldown = 600  # 10 minutes base
-                next_cooldown = base_cooldown * (2 ** new_failure_count)
-                next_cooldown_mins = next_cooldown // 60
-                
-                self.plugin.log(
-                    f"Rebalance failed: {error}. "
-                    f"Failure #{new_failure_count} for {candidate.to_channel[:12]}..., "
-                    f"next attempt backoff: {next_cooldown_mins} minutes",
-                    level='warn'
-                )
-                
+                error = f"Unknown rebalancer: {self.config.rebalancer_plugin}"
+                self.database.update_rebalance_result(rebalance_id, 'failed', error_message=error)
+                result["message"] = error
+
         except Exception as e:
-            result["message"] = f"Error: {str(e)}"
-            self.plugin.log(f"Error executing rebalance: {e}", level='error')
-            
-            # ADAPTIVE BACKOFF: Also count exceptions as failures (persisted to DB)
-            self.database.increment_failure_count(candidate.to_channel)
-        finally:
-            # Clear pending status after some time
-            pass
+            result["message"] = str(e)
+            self.plugin.log(f"Execution error: {e}", level='error')
         
         return result
-    
+
     def _execute_circular(self, candidate: RebalanceCandidate) -> Dict[str, Any]:
         """
-        Execute rebalance using the circular plugin via RPC.
-        
-        THE STRATEGIST AND DRIVER PATTERN:
-        - This module (Strategist) has already calculated the EV and constraints
-        - Circular (Driver) handles the actual pathfinding and payment execution
-        - We tell circular: "Move X sats from A to B, max Y ppm fee. Go."
-        
-        Circular API signature:
-            circular <out_channel_id> <in_channel_id> <amount> [max_ppm] [max_hops] [timeout]
-        
-        Since circular only does one attempt per call, we wrap in a retry loop.
-        
-        Args:
-            candidate: The RebalanceCandidate with pre-calculated constraints
-            
-        Returns:
-            Result dict with success status and fee info
+        Execute circular rebalance (synchronous).
+        Signature: circular outscid inscid amount maxppm attempts maxhops
         """
         result = {"success": False}
         max_attempts = 3
         max_hops = 10
-        timeout_seconds = 60
+        
+        # Normalize SCIDs to colon format
+        out_scid = candidate.from_channel.replace('x', ':')
+        in_scid = candidate.to_channel.replace('x', ':')
         
         self.plugin.log(
-            f"Executing circular rebalance: "
-            f"Out={candidate.from_channel} -> In={candidate.to_channel}"
-        )
-        self.plugin.log(
-            f"EV Constraint: Amount={candidate.amount_msat}msat, "
-            f"MaxFee={candidate.max_budget_msat}msat ({candidate.max_fee_ppm}ppm)"
+            f"Executing circular: {out_scid} -> {in_scid}, max_ppm={candidate.max_fee_ppm}"
         )
         
         for attempt in range(max_attempts):
             try:
-                # Call circular via RPC with positional arguments:
-                # circular out_channel_id in_channel_id amount [max_ppm] [max_hops] [timeout]
                 response = self.plugin.rpc.circular(
-                    candidate.from_channel,      # out_channel_id - outgoing channel
-                    candidate.to_channel,        # in_channel_id - incoming channel
-                    candidate.amount_msat,       # amount in msat
-                    candidate.max_fee_ppm,       # max_ppm - THE CRITICAL CONSTRAINT
-                    max_hops,                    # max_hops - maximum route length
-                    timeout_seconds              # timeout - seconds before giving up
+                    out_scid, 
+                    in_scid, 
+                    candidate.amount_msat, 
+                    candidate.max_fee_ppm, 
+                    1,          # attempts per call
+                    max_hops
                 )
                 
-                # Analyze Result
                 if response.get("status") == "success":
                     fee_msat = response.get("fee", 0)
-                    result["success"] = True
-                    result["fee_sats"] = fee_msat // 1000
-                    result["fee_msat"] = fee_msat
-                    result["attempts"] = attempt + 1
-                    self.plugin.log(f"Circular SUCCESS on attempt {attempt + 1}. Paid: {fee_msat} msat")
-                    break  # Success - exit retry loop
-                else:
-                    error_msg = response.get("message", "Rebalance did not complete")
-                    result["error"] = error_msg
-                    self.plugin.log(
-                        f"Circular attempt {attempt + 1}/{max_attempts} FAILED: {error_msg}",
-                        level='debug'
-                    )
-                    # Continue to next attempt
-                    
-            except RpcError as e:
-                # Handle case where circular is not installed or crashes
-                error_msg = str(e)
-                if "Unknown command" in error_msg:
-                    result["error"] = "circular plugin not installed. Install from: https://github.com/giovannizotta/circular"
-                    self.plugin.log("Circular plugin not installed", level='error')
-                    break  # No point retrying if plugin isn't installed
-                else:
-                    result["error"] = f"RPC Error: {error_msg}"
-                    self.plugin.log(
-                        f"RPC Error on attempt {attempt + 1}/{max_attempts}: {error_msg}",
-                        level='debug' if attempt < max_attempts - 1 else 'error'
-                    )
-                    # Continue to next attempt for transient errors
-                    
-            except Exception as e:
-                result["error"] = str(e)
-                self.plugin.log(
-                    f"Error on attempt {attempt + 1}/{max_attempts}: {e}",
-                    level='debug' if attempt < max_attempts - 1 else 'error'
-                )
-                # Continue to next attempt
-        
-        if not result["success"]:
-            self.plugin.log(
-                f"Circular FAILED after {max_attempts} attempts: {result.get('error', 'Unknown error')}"
-            )
-        
-        return result
-    
-    def _execute_sling(self, candidate: RebalanceCandidate) -> Dict[str, Any]:
-        """
-        Execute rebalance using the sling plugin.
-        
-        sling is another CLN rebalancing plugin with different semantics.
-        
-        Args:
-            candidate: The rebalance to execute
-            
-        Returns:
-            Result dict with success status and fee info
-        """
-        result = {"success": False}
-        
-        try:
-            # sling uses a job-based approach
-            # First, create a job
-            job_result = self.plugin.rpc.call(
-                "sling-job",
-                {
-                    "channel": candidate.to_channel,  # Channel to fill
-                    "direction": "pull",  # Pull liquidity from network
-                    "amount": candidate.amount_sats * 1000,  # msat
-                    "maxppm": candidate.max_budget_sats * 1_000_000 // candidate.amount_sats,
-                    "outppm": candidate.outbound_fee_ppm
-                }
-            )
-            
-            # Check result
-            if job_result.get("status") in ["complete", "success"]:
-                result["success"] = True
-                result["fee_sats"] = job_result.get("fee_msat", 0) // 1000
-            else:
-                result["error"] = job_result.get("message", "Sling job did not complete")
+                    return {"success": True, "fee_sats": fee_msat // 1000, "fee_msat": fee_msat}
                 
-        except RpcError as e:
-            # sling might not be installed
-            if "Unknown command" in str(e):
-                result["error"] = "sling plugin not available"
-            else:
-                result["error"] = str(e)
-        except Exception as e:
-            result["error"] = str(e)
+                self.plugin.log(
+                    f"Circular attempt {attempt+1} failed: {response.get('message')}", 
+                    level='debug'
+                )
+                time.sleep(1)
+            except Exception as e:
+                self.plugin.log(f"Circular RPC error: {e}", level='debug')
         
-        return result
-    
-    def manual_rebalance(self, from_channel: str, to_channel: str,
-                        amount_sats: int, max_fee_sats: Optional[int] = None
-                        ) -> Dict[str, Any]:
-        """
-        Execute a manual rebalance with EV checks.
-        
-        Even for manual rebalances, we calculate and display the EV
-        to help the operator make informed decisions.
-        
-        Args:
-            from_channel: Source channel
-            to_channel: Destination channel
-            amount_sats: Amount to move
-            max_fee_sats: Optional fee cap (calculated if not provided)
-            
-        Returns:
-            Result dict with execution details
-        """
-        # Get channel info
+        return {"error": "Circular rebalance failed after retries"}
+
+    def manual_rebalance(self, from_channel: str, to_channel: str, 
+                         amount_sats: int, max_fee_sats: int = None) -> Dict[str, Any]:
+        """Execute a manual rebalance between two channels."""
         channels = self._get_channels_with_balances()
+        if from_channel not in channels or to_channel not in channels:
+            return {"error": "Channels not found"}
+            
+        f_info = channels[from_channel]
+        t_info = channels[to_channel]
         
-        from_info = channels.get(from_channel)
-        to_info = channels.get(to_channel)
+        fee_ppm = t_info.get("fee_ppm", 0)
+        src_ppm = f_info.get("fee_ppm", 0)
+        est_in = self._estimate_inbound_fee(t_info.get("peer_id"))
         
-        if not from_info or not to_info:
-            return {"success": False, "error": "Channel not found"}
-        
-        # Check flow state for warning
-        dest_state = self.database.get_channel_state(to_channel)
-        dest_flow_state = dest_state.get("state", "unknown") if dest_state else "unknown"
-        
-        # Warn if trying to rebalance into a SINK
-        if dest_flow_state == "sink":
-            self.plugin.log(
-                f"Warning: {to_channel} is a SINK channel. It fills itself for free. "
-                f"Consider NOT rebalancing into it.",
-                level='warn'
-            )
-        
-        # Calculate EV even for manual
-        outbound_fee_ppm = to_info.get("fee_ppm", 0)
-        inbound_fee_ppm = self._estimate_inbound_fee(to_info.get("peer_id", ""))
-        
-        # Get source channel fee (opportunity cost)
-        source_fee_ppm = from_info.get("fee_ppm", 0)
-        
-        # Calculate spread including opportunity cost
-        spread_ppm = outbound_fee_ppm - inbound_fee_ppm - source_fee_ppm
-        
-        # Convert to msat
-        amount_msat = amount_sats * 1000
-        
-        # Calculate max budget if not provided
         if max_fee_sats is None:
-            max_fee_sats = max(0, (spread_ppm * amount_sats) // 1_000_000)
-        
-        max_budget_msat = max_fee_sats * 1000
-        
-        # Calculate max fee PPM for circular
-        if amount_msat > 0:
-            max_fee_ppm = int((max_budget_msat / amount_msat) * 1_000_000)
-        else:
-            max_fee_ppm = 0
-        
-        # Calculate turnover rates for tracking
-        dest_capacity = to_info.get("capacity", 1)
-        source_capacity = from_info.get("capacity", 1)
-        dest_turnover_rate = self._calculate_turnover_rate(to_channel, dest_capacity)
-        source_turnover_rate = self._calculate_turnover_rate(from_channel, source_capacity)
-        
-        # Calculate weighted opportunity cost (same as automatic rebalance logic)
-        turnover_weight = min(1.0, source_turnover_rate * 7)  # 7-day projection
-        weighted_opp_cost = int(source_fee_ppm * turnover_weight)
-        
-        # Recalculate spread with weighted opportunity cost
-        spread_ppm = outbound_fee_ppm - inbound_fee_ppm - weighted_opp_cost
-        
-        # Calculate expected profit including weighted opportunity cost
-        expected_utilization = max(dest_turnover_rate * (self.config.rebalance_cooldown_hours / 24.0), 0.05)
-        expected_routing = amount_sats * expected_utilization
-        expected_fee_income = (expected_routing * outbound_fee_ppm) // 1_000_000
-        expected_source_loss = (expected_routing * source_fee_ppm * turnover_weight) // 1_000_000
-        expected_profit = expected_fee_income - max_fee_sats - expected_source_loss
-        
-        # Build candidate
-        candidate = RebalanceCandidate(
-            from_channel=from_channel,
-            to_channel=to_channel,
-            from_peer_id=from_info.get("peer_id", ""),
-            to_peer_id=to_info.get("peer_id", ""),
-            amount_sats=amount_sats,
-            amount_msat=amount_msat,
-            outbound_fee_ppm=outbound_fee_ppm,
-            inbound_fee_ppm=inbound_fee_ppm,
-            source_fee_ppm=source_fee_ppm,
-            weighted_opp_cost_ppm=weighted_opp_cost,
-            spread_ppm=spread_ppm,
-            max_budget_sats=max_fee_sats,
-            max_budget_msat=max_budget_msat,
-            max_fee_ppm=max_fee_ppm,
-            expected_profit_sats=expected_profit,
-            liquidity_ratio=to_info.get("spendable_sats", 0) / max(to_info.get("capacity", 1), 1),
-            dest_flow_state=dest_flow_state,
-            dest_turnover_rate=dest_turnover_rate,
-            source_turnover_rate=source_turnover_rate
+            max_fee_sats = int(amount_sats * (fee_ppm - est_in - src_ppm) / 1e6)
+            if max_fee_sats < 0: 
+                max_fee_sats = 100
+            
+        cand = RebalanceCandidate(
+            from_channel, to_channel, f_info.get("peer_id"), t_info.get("peer_id"),
+            amount_sats, amount_sats * 1000, fee_ppm, est_in, src_ppm,
+            0, 0, max_fee_sats, max_fee_sats * 1000, 
+            int(max_fee_sats * 1e6 / amount_sats) if amount_sats > 0 else 0,
+            0, 0.5, "manual", 0, 0
         )
-        
-        # Warn if negative EV (including weighted opportunity cost)
-        if spread_ppm <= 0:
-            self.plugin.log(
-                f"Warning: Manual rebalance has negative EV after weighted opportunity cost "
-                f"(dest={outbound_fee_ppm}ppm - rebal={inbound_fee_ppm}ppm - "
-                f"weighted_opp={weighted_opp_cost}ppm [raw={source_fee_ppm}ppm * {turnover_weight:.0%}] = {spread_ppm}ppm)",
-                level='warn'
-            )
-        
-        return self.execute_rebalance(candidate)
-    
+        return self.execute_rebalance(cand)
+
     def _check_capital_controls(self) -> bool:
-        """
-        Check Global Capital Controls before allowing rebalancing.
-        
-        This prevents over-spending by:
-        1. Checking if total wallet reserve (on-chain + channel receivable) is above minimum
-        2. Checking if daily rebalancing budget has been exceeded
-        
-        Returns:
-            True if rebalancing is allowed, False if capital controls block it
-        """
-        # Check 1: Minimum Wallet Reserve
-        # If total spendable (on-chain + channel receivable) < min_wallet_reserve, ABORT
+        """Check if capital controls allow rebalancing."""
         try:
             listfunds = self.plugin.rpc.listfunds()
-            
-            # Sum on-chain spendable (confirmed outputs)
             onchain_sats = 0
             for output in listfunds.get("outputs", []):
                 if output.get("status") == "confirmed":
                     amount_msat = output.get("amount_msat", 0)
-                    if isinstance(amount_msat, str):
-                        # Handle "123456msat" format
+                    if isinstance(amount_msat, str): 
                         amount_msat = int(amount_msat.replace("msat", ""))
                     onchain_sats += amount_msat // 1000
             
-            # Sum channel spendable (our local balance - this is OUR money)
             channel_spendable_sats = 0
             for channel in listfunds.get("channels", []):
-                if channel.get("state") != "CHANNELD_NORMAL":
+                if channel.get("state") != "CHANNELD_NORMAL": 
                     continue
                 our_amount_msat = channel.get("our_amount_msat", 0)
-                if isinstance(our_amount_msat, str):
+                if isinstance(our_amount_msat, str): 
                     our_amount_msat = int(our_amount_msat.replace("msat", ""))
-                # Spendable = our_amount (This is Our Money, which pays the fees)
                 spendable = our_amount_msat // 1000
-                if spendable > 0:
+                if spendable > 0: 
                     channel_spendable_sats += spendable
             
             total_reserve = onchain_sats + channel_spendable_sats
-            min_reserve = self.config.min_wallet_reserve
-            
-            if total_reserve < min_reserve:
+            if total_reserve < self.config.min_wallet_reserve:
                 self.plugin.log(
-                    f"CAPITAL CONTROL: Wallet reserve too low! "
-                    f"on-chain={onchain_sats:,} + channel_spendable={channel_spendable_sats:,} = "
-                    f"{total_reserve:,} sats < min_reserve={min_reserve:,} sats. "
-                    f"ABORTING all rebalancing operations.",
+                    f"CAPITAL CONTROL: Wallet reserve {total_reserve} < "
+                    f"{self.config.min_wallet_reserve}", 
                     level='warning'
                 )
                 return False
-            
-        except RpcError as e:
-            self.plugin.log(f"Error checking wallet reserve: {e}", level='error')
-            # Fail-safe: allow rebalancing if we can't check
-            self.plugin.log("Continuing with rebalance (could not verify reserve)")
-        
-        # Check 2: Daily Budget
-        # Sum fees spent in last 24 hours, abort if over budget
-        try:
-            now = int(time.time())
-            twenty_four_hours_ago = now - (24 * 60 * 60)
-            
-            fees_spent_24h = self.database.get_total_rebalance_fees(twenty_four_hours_ago)
-            daily_budget = self.config.daily_budget_sats
-            
-            if fees_spent_24h >= daily_budget:
+                
+            fees_spent_24h = self.database.get_total_rebalance_fees(int(time.time()) - 86400)
+            if fees_spent_24h >= self.config.daily_budget_sats:
                 self.plugin.log(
-                    f"CAPITAL CONTROL: Daily rebalancing budget exceeded! "
-                    f"Spent {fees_spent_24h:,} sats in last 24h >= budget of {daily_budget:,} sats. "
-                    f"ABORTING rebalancing until budget resets.",
+                    f"CAPITAL CONTROL: Daily budget exceeded "
+                    f"({fees_spent_24h} >= {self.config.daily_budget_sats})", 
                     level='warning'
                 )
                 return False
-            
-            # Log remaining budget
-            remaining = daily_budget - fees_spent_24h
-            self.plugin.log(
-                f"Capital controls OK: {fees_spent_24h:,}/{daily_budget:,} sats spent, "
-                f"{remaining:,} sats remaining in daily budget",
-                level='debug'
-            )
-            
+                
         except Exception as e:
-            self.plugin.log(f"Error checking daily budget: {e}", level='error')
-            # Fail-safe: allow rebalancing if we can't check
-            self.plugin.log("Continuing with rebalance (could not verify budget)")
-        
-        return True
-    
-    def _get_channels_with_balances(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Get all channels with their current balances and HTLC information.
-        
-        Returns:
-            Dict mapping channel_id to channel info including balances and HTLC data
-        """
-        channels = {}
-        
-        try:
-            result = self.plugin.rpc.listpeerchannels()
-            
-            for channel in result.get("channels", []):
-                if channel.get("state") != "CHANNELD_NORMAL":
-                    continue
-                
-                channel_id = channel.get("short_channel_id") or channel.get("channel_id")
-                if not channel_id:
-                    continue
-                
-                # Extract balance info
-                spendable_msat = channel.get("spendable_msat", 0) or 0
-                receivable_msat = channel.get("receivable_msat", 0) or 0
-                
-                # Calculate capacity - may be null in some CLN versions
-                total_msat = channel.get("total_msat") or channel.get("capacity_msat")
-                if not total_msat:
-                    total_msat = spendable_msat + receivable_msat
-                
-                # Get fee info - in newer CLN it's under updates.local
-                updates = channel.get("updates", {})
-                local_updates = updates.get("local", {})
-                
-                # Try updates.local first, fall back to top-level
-                fee_base = local_updates.get("fee_base_msat") or channel.get("fee_base_msat", 0)
-                fee_ppm = local_updates.get("fee_proportional_millionths") or channel.get("fee_proportional_millionths", 0)
-                
-                # Extract HTLC limits and current usage for congestion detection
-                htlc_min = channel.get("htlc_minimum_msat", 0)
-                htlc_max = channel.get("htlc_maximum_msat", 0)
-                max_htlcs = channel.get("max_accepted_htlcs", 483)  # Default per BOLT #2
-                htlcs = channel.get("htlcs", [])
-                active_htlcs = len(htlcs) if htlcs else 0
-                
-                channels[channel_id] = {
-                    "channel_id": channel_id,
-                    "peer_id": channel.get("peer_id", ""),
-                    "capacity": total_msat // 1000 if total_msat else 0,
-                    "spendable_sats": spendable_msat // 1000,
-                    "receivable_sats": receivable_msat // 1000,
-                    "fee_base_msat": fee_base,
-                    "fee_ppm": fee_ppm,
-                    "htlc_min_msat": htlc_min,
-                    "htlc_max_msat": htlc_max,
-                    "max_htlcs": max_htlcs,
-                    "active_htlcs": active_htlcs
-                }
-                
-        except RpcError as e:
-            self.plugin.log(f"Error getting channel balances: {e}", level='error')
-        
-        return channels
+            self.plugin.log(f"Error checking capital controls: {e}", level='error')
+        return True 
     
     def _is_pending_with_backoff(self, channel_id: str) -> bool:
-        """
-        Check if a channel should be skipped due to pending status or adaptive backoff.
-        
-        ADAPTIVE FAILURE BACKOFF (Task 3):
-        Instead of a fixed 10-minute cooldown, we use exponential backoff
-        based on consecutive failures:
-        
-        - 0 failures: 10 min base cooldown
-        - 1 failure:  20 min (10 * 2^1)
-        - 2 failures: 40 min (10 * 2^2)
-        - 3 failures: 80 min (10 * 2^3)
-        - etc.
-        
-        PERSISTENCE (Day 2 Task 2):
-        Failure counts are now stored in the database (channel_failures table)
-        to survive plugin restarts and prevent "retry storms" on broken channels.
-        
-        This prevents wasting resources on "stuck" channels that keep failing,
-        while still allowing quick retries for channels that just had a one-off issue.
-        
-        Args:
-            channel_id: Channel to check
+        """Check if channel has a pending operation with exponential backoff."""
+        # Also check job manager for active jobs
+        if self.job_manager.has_active_job(channel_id):
+            return True
             
-        Returns:
-            True if channel should be skipped (pending or in backoff)
-        """
         pending_time = self._pending.get(channel_id, 0)
-        if pending_time == 0:
+        if pending_time == 0: 
             return False
         
-        # Get failure count from database (persistent across restarts)
         failure_count, _ = self.database.get_failure_count(channel_id)
-        base_cooldown = 600  # 10 minutes base
+        base_cooldown = 600
+        cooldown = base_cooldown * (2 ** min(failure_count, 4))
         
-        # Exponential backoff: base * 2^failures
-        # Cap at ~2.7 hours (10 min * 2^4 = 160 min) to prevent infinite waits
-        max_failures_for_backoff = 4
-        effective_failures = min(failure_count, max_failures_for_backoff)
-        cooldown = base_cooldown * (2 ** effective_failures)
-        
-        time_since_attempt = int(time.time()) - pending_time
-        
-        if time_since_attempt > cooldown:
-            # Cooldown expired, clear pending status
+        if int(time.time()) - pending_time > cooldown:
             del self._pending[channel_id]
             return False
-        
-        # Still in cooldown
-        if failure_count > 0:
-            remaining = cooldown - time_since_attempt
-            self.plugin.log(
-                f"Skipping {channel_id[:12]}...: in backoff after {failure_count} failures "
-                f"({remaining // 60} min remaining)",
-                level='debug'
-            )
-        
         return True
     
-    def _is_pending(self, channel_id: str, timeout: int = 600) -> bool:
-        """
-        Check if a channel has a pending rebalance.
-        
-        DEPRECATED: Use _is_pending_with_backoff() for adaptive backoff.
-        Kept for backward compatibility.
-        
-        Args:
-            channel_id: Channel to check
-            timeout: How long to consider pending (default 10 min)
-            
-        Returns:
-            True if a rebalance is pending
-        """
-        pending_time = self._pending.get(channel_id, 0)
-        if pending_time == 0:
-            return False
-        
-        # Check if timed out
-        if int(time.time()) - pending_time > timeout:
-            del self._pending[channel_id]
-            return False
-        
-        return True
+    # =========================================================================
+    # Job Management API (exposed for RPC commands)
+    # =========================================================================
     
-    def reset_failure_count(self, channel_id: str) -> None:
-        """
-        Manually reset the failure count for a channel.
-        
-        Use this when manually intervening or when conditions change.
-        
-        Args:
-            channel_id: Channel to reset
-        """
-        self.database.reset_failure_count(channel_id)
-        self.plugin.log(f"Reset failure count for {channel_id}")
+    def get_active_jobs(self) -> List[Dict[str, Any]]:
+        """Get status of all active rebalance jobs."""
+        return self.job_manager.get_all_jobs_status()
     
-    def get_failure_counts(self) -> Dict[str, Tuple[int, int]]:
-        """
-        Get all current failure counts.
-        
-        Returns:
-            Dict mapping channel_id to (failure_count, last_failure_time)
-        """
-        return self.database.get_all_failure_counts()
+    def stop_rebalance_job(self, channel_id: str) -> Dict[str, Any]:
+        """Manually stop a rebalance job."""
+        if self.job_manager.stop_job(channel_id, reason="manual"):
+            return {"success": True, "message": f"Stopped job for {channel_id}"}
+        return {"success": False, "error": f"No active job for {channel_id}"}
+    
+    def stop_all_rebalance_jobs(self) -> Dict[str, Any]:
+        """Stop all active rebalance jobs."""
+        count = self.job_manager.stop_all_jobs(reason="manual_stop_all")
+        return {"success": True, "stopped": count}

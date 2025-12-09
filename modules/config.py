@@ -88,6 +88,11 @@ class Config:
                                       # Full Kelly (1.0) maximizes growth but has high volatility
                                       # Half Kelly (0.5) reduces volatility drag significantly
     
+    # Async Job Queue (Phase 4: Stability & Scaling)
+    max_concurrent_jobs: int = 5              # Max number of concurrent sling rebalance jobs
+    sling_job_timeout_seconds: int = 7200     # Timeout for sling jobs (2 hours default)
+    sling_chunk_size_sats: int = 500000       # Amount per sling rebalance attempt (500k sats)
+    
     # Safety flags
     dry_run: bool = False          # If True, log but don't execute
 

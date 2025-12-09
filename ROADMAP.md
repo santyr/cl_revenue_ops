@@ -31,9 +31,11 @@ This document outlines the development path to move `cl-revenue-ops` from a "Pow
     - Detect "Market Calm" (low revenue variance).
     - Enter "Sleep Mode" for stable channels to reduce gossip noise.
     - Wake up immediately on revenue spikes.
-- [ ] **Async Job Queue**:
+- [x] **Async Job Queue**:
     - Refactor `rebalancer.py` to decouple decision-making from execution.
     - Allow concurrent rebalancing attempts (if supported by the underlying rebalancer plugin).
+    - JobManager class manages sling background jobs lifecycle.
+    - Configurable max_concurrent_jobs, job timeout, and chunk sizes.
 
 ---
 *Roadmap updated: December 08, 2025*
